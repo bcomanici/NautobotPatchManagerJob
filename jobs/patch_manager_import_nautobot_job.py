@@ -288,6 +288,7 @@ class PatchManagerImport(Job):
                         conflicting_device.name,
                     )
                     position = None
+                    face = None
 
             device_defaults = {
                 "device_type": device_type,
@@ -296,7 +297,7 @@ class PatchManagerImport(Job):
                 "location": location,
                 "rack": rack,
                 "position": position,
-                "face": face,
+                "face": face if rack and position is not None else None,
                 "comments": self.clean(row.get(self.fields["device_description"])) or identifier_data["address"],
             }
 
@@ -320,6 +321,7 @@ class PatchManagerImport(Job):
                 )
 
                 device_defaults["position"] = None
+                device_defaults["face"] = None
                 device, created = Device.objects.update_or_create(
                     name=name,
                     defaults=device_defaults,
