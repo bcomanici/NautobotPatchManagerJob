@@ -305,7 +305,7 @@ class PatchManagerImport(Job):
                     "comments": comments,
                 },
             )
-            self.logger.info(     "%s device %s",     "Created" if created else "Updated",     device.name, )
+            self.logger.info("%s device %s", "Created" if created else "Updated", device)
 
     def import_cables(self, rows: Iterable[Dict[str, Any]]) -> None:
         status = self.get_status()
