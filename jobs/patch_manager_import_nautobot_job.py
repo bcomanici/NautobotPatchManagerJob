@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 
 import requests
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from nautobot.apps.jobs import BooleanVar, ChoiceVar, IntegerVar, Job, StringVar
 from nautobot.dcim.models import Cable, Device, DeviceType, Interface, Location, LocationType, Manufacturer, Rack
@@ -264,6 +265,8 @@ class PatchManagerImport(Job):
 
             existing_device = Device.objects.filter(name=name).first()
 
+            self.handle_front_rear_shared_position(rack, position, face, device_type)
+
             if rack:
                 conflict_qs = Device.objects.filter(rack=rack, position=position, face=face)
 
@@ -284,19 +287,41 @@ class PatchManagerImport(Job):
                     )
                     position = None
 
-            device, created = Device.objects.update_or_create(
-                name=name,
-                defaults={
-                    "device_type": device_type,
-                    "role": role,
-                    "status": status,
-                    "location": location,
-                    "rack": rack,
-                    "position": position,
-                    "face": face,
-                    "comments": self.clean(row.get(self.fields["device_description"])) or identifier_data["address"],
-                },
-            )
+            device_defaults = {
+                "device_type": device_type,
+                "role": role,
+                "status": status,
+                "location": location,
+                "rack": rack,
+                "position": position,
+                "face": face,
+                "comments": self.clean(row.get(self.fields["device_description"])) or identifier_data["address"],
+            }
+
+            try:
+                device, created = Device.objects.update_or_create(
+                    name=name,
+                    defaults=device_defaults,
+                )
+            except ValidationError as exc:
+                if "position" not in getattr(exc, "message_dict", {}):
+                    raise
+
+                self.logger.warning(
+                    "Rack position validation failed for %s at rack=%s position=%s face=%s: %s. "
+                    "Retrying import without rack position.",
+                    name,
+                    rack.name if rack else None,
+                    position,
+                    face,
+                    exc,
+                )
+
+                device_defaults["position"] = None
+                device, created = Device.objects.update_or_create(
+                    name=name,
+                    defaults=device_defaults,
+                )
 
             self.logger.info("%s device %s", "Created" if created else "Updated", device.name)
 
@@ -426,6 +451,53 @@ class PatchManagerImport(Job):
 
         lines.append(PM_PORT_DETAILS_END)
         return "\n".join(lines)
+
+    def handle_front_rear_shared_position(
+        self,
+        rack: Optional[Rack],
+        position: Optional[int],
+        face: str,
+        device_type: DeviceType,
+    ) -> None:
+        """
+        If Patch Manager has two devices at the same rack/U position, one front
+        and one rear, make both device types not full-depth so Nautobot can
+        model the shared rack unit correctly.
+        """
+        if not rack or position is None:
+            return
+
+        opposite_face = "rear" if face == "front" else "front"
+        opposite_device = Device.objects.filter(
+            rack=rack,
+            position=position,
+            face=opposite_face,
+        ).first()
+
+        if not opposite_device:
+            return
+
+        self.set_device_type_not_full_depth(device_type)
+
+        if opposite_device.device_type:
+            self.set_device_type_not_full_depth(opposite_device.device_type)
+
+        self.logger.info(
+            "Detected front/rear shared rack position at rack=%s U%s; marked device types as not full-depth.",
+            rack.name,
+            position,
+        )
+
+    def set_device_type_not_full_depth(self, device_type: DeviceType) -> None:
+        if not getattr(device_type, "is_full_depth", False):
+            return
+
+        device_type.is_full_depth = False
+        device_type.validated_save()
+        self.logger.info(
+            "Set device type %s to not full-depth",
+            device_type.model,
+        )
 
     def import_cables(self, rows: Iterable[Dict[str, Any]]) -> None:
         status = self.get_status()
