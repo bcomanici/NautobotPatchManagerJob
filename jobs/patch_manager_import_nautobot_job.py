@@ -315,7 +315,8 @@ class PatchManagerImport(Job):
             secrets_group=group,
             secret__name=secret_name,
         )
-        return association.secret.get_value()
+        value = association.secret.get_value()
+        return "" if value is None else str(value).strip()
 
     def get_interface_for_endpoint(self, endpoint: PMEndpoint) -> Optional[Interface]:
         device = self.find_device(endpoint.device_name)
