@@ -368,7 +368,6 @@ class PatchManagerImport(Job):
         device_type, _ = DeviceType.objects.get_or_create(
             manufacturer=manufacturer,
             model=clean_name,
-            defaults={"slug": slugify(clean_name)[:50] or "patch-manager-device"},
         )
         return device_type
 
