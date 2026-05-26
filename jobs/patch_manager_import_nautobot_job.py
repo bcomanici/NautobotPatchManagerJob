@@ -12,7 +12,13 @@ Current behavior
   - /rest/cables?format=Cable+Export
 - Does not call /rest/ports.
 - Creates interfaces on demand from Cable Export connection strings.
-- Uses Equipment Identifier as a fallback if Equipment Label is blank.
+- Parses Equipment Identifier as:
+    role, location, address, rack1, rack2, ...
+- Uses the parsed role as the Nautobot Device Role.
+- Uses the parsed location as the fallback Nautobot Location.
+- Uses the parsed address as the device comments fallback.
+- Matches the first parsed rack name that exists from the rack import.
+- Uses Equipment Label as the device name, falling back to the last Equipment Identifier value.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ import requests
 from django.db import transaction
 from nautobot.apps.jobs import BooleanVar, ChoiceVar, IntegerVar, Job, StringVar
 from nautobot.dcim.models import Cable, Device, DeviceType, Interface, Location, LocationType, Manufacturer, Rack
-from nautobot.extras.models import SecretsGroup, SecretsGroupAssociation, Status
+from nautobot.extras.models import Role, SecretsGroup, SecretsGroupAssociation, Status
 
 
 DEFAULT_FORMATS = {
@@ -62,6 +68,8 @@ PORT_TYPE_DEFAULT = "1000base-t"
 DEFAULT_MANUFACTURER_NAME = "Patch Manager"
 DEFAULT_LOCATION_TYPE_NAME = "Patch Manager Site"
 DEFAULT_STATUS_NAME = "Active"
+DEFAULT_DEVICE_ROLE_NAME = "Patch Manager Imported"
+DEFAULT_LOCATION_NAME = "Patch Manager"
 
 CONNECTION_SPLIT_RE = re.compile(r"\s*\|\s*|\s*;\s*")
 PM_TEMPLATE_BRACKET_RE = re.compile(r"\[[^\]]+\]")
@@ -72,6 +80,14 @@ class PMEndpoint:
     raw: str
     device_name: str
     port_name: str
+
+
+@dataclass(frozen=True)
+class PMEquipmentIdentifier:
+    role: str
+    location: str
+    address: str
+    racks: List[str]
 
 
 class PatchManagerClient:
@@ -99,7 +115,7 @@ class PatchManagerClient:
         while True:
             params = {"start": start, "limit": limit}
             if fmt:
-                # Important: Patch Manager accepted Cabinet+Export via curl.
+                # Patch Manager accepted Cabinet+Export via curl.
                 # urlencode() encodes spaces as "+", matching that behavior.
                 params["format"] = fmt
 
@@ -115,7 +131,8 @@ class PatchManagerClient:
                         "for this endpoint, for example a Cabinets data format for /rest/cabinets."
                     )
                 raise requests.HTTPError(
-                    f"{response.status_code} Client Error for url: {url}; response body: {response.text[:1000]}{hint}",
+                    f"{response.status_code} Client Error for url: {url}; "
+                    f"response body: {response.text[:1000]}{hint}",
                     response=response,
                 )
 
@@ -231,7 +248,7 @@ class PatchManagerImport(Job):
                 self.logger.warning("Skipping rack without name: %s", row)
                 continue
 
-            location_name = self.clean(row.get(self.fields["rack_location"])) or "Patch Manager"
+            location_name = self.clean(row.get(self.fields["rack_location"])) or DEFAULT_LOCATION_NAME
             location = self.get_or_create_location(location_name)
 
             rack, created = Rack.objects.update_or_create(
@@ -248,38 +265,44 @@ class PatchManagerImport(Job):
         status = self.get_status()
 
         for row in rows:
-            name = self.clean(row.get(self.fields["device_name"]))
+            identifier_raw = self.clean(row.get(self.fields["device_identifier"]))
+            identifier = self.parse_equipment_identifier(identifier_raw)
 
-            if not name:
-                identifier = self.clean(row.get(self.fields["device_identifier"]))
-                if identifier:
-                    name = identifier.split(",")[-1].strip() or identifier
-                    self.logger.info("Using Equipment Identifier as device name: %s", name)
+            name = self.clean(row.get(self.fields["device_name"]))
+            if not name and identifier_raw:
+                # Keep the prior behavior: fallback to the last comma-separated identifier value.
+                # With the new identifier shape, this is usually the deepest rack value.
+                name = identifier_raw.split(",")[-1].strip() or identifier_raw
+                self.logger.info("Using Equipment Identifier as device name: %s", name)
 
             if not name:
                 self.logger.warning("Skipping device without name or identifier: %s", row)
                 continue
 
             device_type = self.get_or_create_device_type(self.clean(row.get(self.fields["device_type"])))
+            role = self.get_or_create_device_role(identifier.role)
 
-            rack = self.find_rack(self.clean(row.get(self.fields["device_rack"])))
-            location = rack.location if rack else self.get_or_create_location(
-                self.clean(row.get(self.fields["device_location"])) or "Patch Manager"
-            )
+            rack = self.find_rack_for_device(row, identifier)
+            if rack:
+                location = rack.location
+            else:
+                explicit_location = self.clean(row.get(self.fields["device_location"]))
+                location = self.get_or_create_location(explicit_location or identifier.location or DEFAULT_LOCATION_NAME)
 
             position, face = self.parse_rack_position(self.clean(row.get(self.fields["device_position"])))
+            comments = self.clean(row.get(self.fields["device_description"])) or identifier.address
 
             device, created = Device.objects.update_or_create(
                 name=name,
                 defaults={
                     "device_type": device_type,
-                    "role": None,
+                    "role": role,
                     "status": status,
                     "location": location,
                     "rack": rack,
                     "position": position,
                     "face": face,
-                    "comments": self.clean(row.get(self.fields["device_description"])),
+                    "comments": comments,
                 },
             )
             self.logger.info("%s device %s", "Created" if created else "Updated", device)
@@ -371,6 +394,34 @@ class PatchManagerImport(Job):
 
         return PMEndpoint(raw=raw, device_name=parts[-2], port_name=parts[-1])
 
+    def parse_equipment_identifier(self, value: str) -> PMEquipmentIdentifier:
+        """
+        Parse Equipment Identifier as:
+            role, location, address, rack1, rack2, ...
+        """
+        parts = [p.strip() for p in value.split(",") if p.strip()]
+
+        return PMEquipmentIdentifier(
+            role=parts[0] if len(parts) > 0 else DEFAULT_DEVICE_ROLE_NAME,
+            location=parts[1] if len(parts) > 1 else DEFAULT_LOCATION_NAME,
+            address=parts[2] if len(parts) > 2 else "",
+            racks=parts[3:] if len(parts) > 3 else [],
+        )
+
+    def find_rack_for_device(self, row: Dict[str, Any], identifier: PMEquipmentIdentifier) -> Optional[Rack]:
+        """Find a rack from the explicit equipment rack field, then from parsed Equipment Identifier racks."""
+        explicit_rack = self.find_rack(self.clean(row.get(self.fields["device_rack"])))
+        if explicit_rack:
+            return explicit_rack
+
+        for rack_name in identifier.racks:
+            rack = self.find_rack(rack_name)
+            if rack:
+                self.logger.info("Matched rack %s from Equipment Identifier", rack.name)
+                return rack
+
+        return None
+
     def find_device(self, value: str) -> Optional[Device]:
         if not value:
             return None
@@ -387,7 +438,7 @@ class PatchManagerImport(Job):
 
     def get_or_create_location(self, qname: str) -> Location:
         parts = [p.strip() for p in qname.split(",") if p.strip()]
-        name = parts[-1] if parts else "Patch Manager"
+        name = parts[-1] if parts else DEFAULT_LOCATION_NAME
 
         location_type, _ = LocationType.objects.get_or_create(
             name=DEFAULT_LOCATION_TYPE_NAME,
@@ -414,6 +465,11 @@ class PatchManagerImport(Job):
         )
         return device_type
 
+    def get_or_create_device_role(self, name: str) -> Role:
+        role_name = name or DEFAULT_DEVICE_ROLE_NAME
+        role, _ = Role.objects.get_or_create(name=role_name)
+        return role
+
     def get_status(self) -> Status:
         status = Status.objects.filter(name=DEFAULT_STATUS_NAME).first()
         if not status:
@@ -435,7 +491,7 @@ class PatchManagerImport(Job):
             face = "front"
 
         return position, face
-#
+
     @staticmethod
     def clean(value: Any) -> str:
         return "" if value is None else str(value).strip()
