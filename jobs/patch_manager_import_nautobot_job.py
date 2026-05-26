@@ -364,44 +364,51 @@ class PatchManagerImport(Job):
         rack-mounted Nautobot device.
 
         Matching rules:
-        - Equipment Identifier must contain a rack reference that matches an
-          imported Nautobot rack after normalization.
-        - This handles Patch Manager forms like "Rack 301.09" matching imported
-          Nautobot rack names like "301.09 Rack".
-        - Within matched racks, find a mounted device whose normalized name is
-          contained somewhere in the normalized Equipment Identifier text.
-        - Prefer the longest device-name match to avoid selecting a shorter,
-          less-specific name when multiple devices match.
+        - First find mounted Nautobot devices whose normalized device name is
+          contained in the normalized Equipment Identifier.
+        - If exactly one mounted device matches, use it even if the rack text did
+          not normalize cleanly.
+        - If multiple mounted devices match, prefer candidates whose rack also
+          appears in the Equipment Identifier.
+        - If multiple candidates still remain, prefer the longest device-name
+          match to avoid selecting a shorter, less-specific name.
         """
         if not value:
             return None
 
         identifier = self.clean(value)
-        identifier_parts = [p.strip() for p in identifier.split(",") if p.strip()]
-        matched_racks = self.find_racks_in_identifier(identifier_parts)
-
-        if not matched_racks:
-            return None
-
         normalized_identifier = self.normalize_pm_match_text(identifier)
-        matched_devices: List[Device] = []
+        identifier_parts = self.split_pm_identifier_parts(identifier)
+        matched_racks = self.find_racks_in_identifier(identifier_parts)
+        matched_rack_ids = {rack.pk for rack in matched_racks}
 
-        for rack in matched_racks:
-            devices = Device.objects.filter(
-                rack=rack,
-                position__isnull=False,
-            ).exclude(name="")
+        candidate_devices: List[Device] = []
 
-            for device in devices:
-                normalized_device_name = self.normalize_pm_match_text(device.name)
-                if normalized_device_name and normalized_device_name in normalized_identifier:
-                    matched_devices.append(device)
+        for device in Device.objects.filter(position__isnull=False).exclude(name=""):
+            normalized_device_name = self.normalize_pm_match_text(device.name)
+            if normalized_device_name and normalized_device_name in normalized_identifier:
+                candidate_devices.append(device)
 
-        if not matched_devices:
+        if not candidate_devices:
             return None
 
-        matched_devices.sort(key=lambda device: len(device.name), reverse=True)
-        return matched_devices[0]
+        if matched_rack_ids:
+            rack_scoped_candidates = [
+                device for device in candidate_devices if device.rack_id in matched_rack_ids
+            ]
+            if rack_scoped_candidates:
+                candidate_devices = rack_scoped_candidates
+
+        candidate_devices.sort(key=lambda device: len(device.name), reverse=True)
+        return candidate_devices[0]
+
+    def split_pm_identifier_parts(self, value: str) -> List[str]:
+        """
+        Split Patch Manager identifiers after replacing escaped comma tokens so
+        fields such as '<COMMA>' do not prevent rack/device text normalization.
+        """
+        normalized = (value or "").replace("<COMMA>", ",")
+        return [part.strip() for part in normalized.split(",") if part.strip()]
 
     def find_racks_in_identifier(self, identifier_parts: List[str]) -> List[Rack]:
         if not identifier_parts:
