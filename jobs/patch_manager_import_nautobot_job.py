@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
@@ -29,8 +29,7 @@ DEFAULT_FIELDS = {
     "device_name": "Equipment Label",
     "device_identifier": "Equipment Identifier",
     "device_type": "Equipment Template",
-    "device_rack": "Equipment Position Cabinet",
-    "device_location": "Equipment Location",
+    "device_position": "Equipment Position",
     "device_description": "Equipment Description",
     "cable_label": "Cable Label",
     "cable_description": "Cable Description",
@@ -201,20 +200,14 @@ class PatchManagerImport(Job):
         status = self.get_status()
 
         for row in rows:
+            name = self.clean(row.get(self.fields["device_name"]))
+            if not name:
+                self.logger.warning("Skipping device without Equipment Label: %s", row)
+                continue
+
             identifier_data = self.parse_equipment_identifier(
                 self.clean(row.get(self.fields["device_identifier"]))
             )
-
-            name = self.clean(row.get(self.fields["device_name"]))
-            if not name:
-                if identifier_data["racks"]:
-                    name = identifier_data["racks"][0]
-                else:
-                    name = self.clean(row.get(self.fields["device_identifier"]))
-
-            if not name:
-                self.logger.warning("Skipping device without name or identifier: %s", row)
-                continue
 
             device_type = self.get_or_create_device_type(
                 self.clean(row.get(self.fields["device_type"]))
@@ -222,17 +215,40 @@ class PatchManagerImport(Job):
             role = self.get_or_create_device_role(identifier_data["role"])
 
             rack = self.find_rack_from_names(identifier_data["racks"])
-            if not rack:
-                rack = self.find_rack(self.clean(row.get(self.fields["device_rack"])))
 
             if rack:
                 location = rack.location
             else:
-                location = self.get_or_create_location(
-                    identifier_data["location"]
-                    or self.clean(row.get(self.fields["device_location"]))
-                    or "Patch Manager"
+                location = self.get_or_create_location(identifier_data["location"] or "Patch Manager")
+
+            position, face = self.parse_equipment_position(
+                self.clean(row.get(self.fields["device_position"]))
+            )
+
+            existing_device = Device.objects.filter(name=name).first()
+
+            if rack and position is not None:
+                conflict_qs = Device.objects.filter(
+                    rack=rack,
+                    position=position,
+                    face=face,
                 )
+
+                if existing_device:
+                    conflict_qs = conflict_qs.exclude(pk=existing_device.pk)
+
+                conflicting_device = conflict_qs.first()
+                if conflicting_device:
+                    self.logger.warning(
+                        "Rack position conflict for %s: rack=%s position=%s face=%s already occupied by %s. "
+                        "Importing device without rack position.",
+                        name,
+                        rack.name,
+                        position,
+                        face,
+                        conflicting_device.name,
+                    )
+                    position = None
 
             device, created = Device.objects.update_or_create(
                 name=name,
@@ -242,10 +258,8 @@ class PatchManagerImport(Job):
                     "status": status,
                     "location": location,
                     "rack": rack,
-                    # Do not import Patch Manager U positions.
-                    # Nautobot enforces unique rack + position + face.
-                    "position": None,
-                    "face": "front",
+                    "position": position,
+                    "face": face,
                     "comments": (
                         self.clean(row.get(self.fields["device_description"]))
                         or identifier_data["address"]
@@ -309,6 +323,21 @@ class PatchManagerImport(Job):
             "address": parts[2] if len(parts) > 2 else "",
             "racks": parts[3:] if len(parts) > 3 else [],
         }
+
+    @staticmethod
+    def parse_equipment_position(value: str) -> Tuple[Optional[int], str]:
+        # Only parse U## and Front/Rear.
+        # Ignore all other text and anything after Front/Rear.
+        if not value:
+            return None, "front"
+
+        u_match = re.search(r"\bU\s*(\d+)\b", value, re.IGNORECASE)
+        position = int(u_match.group(1)) if u_match else None
+
+        face_match = re.search(r"\b(front|rear)\b", value, re.IGNORECASE)
+        face = face_match.group(1).lower() if face_match else "front"
+
+        return position, face
 
     def get_secret_from_group(self, group_name: str, secret_name: str) -> str:
         group = SecretsGroup.objects.get(name=group_name)
