@@ -365,23 +365,61 @@ class PatchManagerImport(Job):
         Resolve a skipped Patch Manager equipment row back to an already-imported,
         rack-mounted Nautobot device.
 
-        Matching rules:
-        - Equipment Identifier must contain a rack reference that matches an
-          imported Nautobot rack after normalization.
-        - This handles Patch Manager forms like "Rack 301.09" matching imported
-          Nautobot rack names like "301.09 Rack".
-        - Within matched racks, find a mounted device whose normalized name is
-          contained somewhere in the normalized Equipment Identifier text.
-        - Prefer the longest device-name match to avoid selecting a shorter,
-          less-specific name when multiple devices match.
+        Matching order:
+        1. Preferred: rack-normalized match, then device-name containment inside
+           that matched rack.
+        2. Conservative fallback: exact comma-separated Equipment Identifier
+           token equals an existing mounted Nautobot device name. If multiple
+           devices have that same name, prefer the one in a rack hinted by the
+           Equipment Identifier.
         """
         if not value:
             return None
 
         identifier = self.clean(value)
-        identifier_parts = [p.strip() for p in identifier.split(",") if p.strip()]
+        identifier_parts = self.split_equipment_identifier_for_matching(identifier)
         matched_racks = self.find_racks_in_identifier(identifier_parts)
 
+        rack_scoped_match = self.find_device_by_rack_scoped_contains(
+            matched_racks=matched_racks,
+            identifier=identifier,
+        )
+        if rack_scoped_match:
+            return rack_scoped_match
+
+        fallback_match = self.find_device_by_exact_identifier_token(
+            identifier_parts=identifier_parts,
+            matched_racks=matched_racks,
+        )
+        if fallback_match:
+            self.logger.info(
+                "Matched skipped port detail row using exact mounted device token fallback: %s",
+                fallback_match.name,
+            )
+            return fallback_match
+
+        if not matched_racks:
+            self.logger.info(
+                "Port detail match failed before device lookup; no rack matched identifier: %s",
+                identifier,
+            )
+        else:
+            self.logger.info(
+                "Port detail match failed after rack match; no mounted device name found in identifier: %s",
+                identifier,
+            )
+
+        return None
+
+    def split_equipment_identifier_for_matching(self, value: str) -> List[str]:
+        normalized = (value or "").replace("<COMMA>", ",")
+        return [part.strip() for part in normalized.split(",") if part.strip()]
+
+    def find_device_by_rack_scoped_contains(
+        self,
+        matched_racks: List[Rack],
+        identifier: str,
+    ) -> Optional[Device]:
         if not matched_racks:
             return None
 
@@ -404,6 +442,41 @@ class PatchManagerImport(Job):
 
         matched_devices.sort(key=lambda device: len(device.name), reverse=True)
         return matched_devices[0]
+
+    def find_device_by_exact_identifier_token(
+        self,
+        identifier_parts: List[str],
+        matched_racks: List[Rack],
+    ) -> Optional[Device]:
+        normalized_parts = {
+            self.normalize_pm_match_text(part)
+            for part in identifier_parts
+            if self.normalize_pm_match_text(part)
+        }
+
+        if not normalized_parts:
+            return None
+
+        candidate_devices: List[Device] = []
+
+        for device in Device.objects.filter(position__isnull=False).exclude(name=""):
+            normalized_device_name = self.normalize_pm_match_text(device.name)
+            if normalized_device_name in normalized_parts:
+                candidate_devices.append(device)
+
+        if not candidate_devices:
+            return None
+
+        matched_rack_ids = {rack.pk for rack in matched_racks}
+        if matched_rack_ids:
+            rack_scoped_candidates = [
+                device for device in candidate_devices if device.rack_id in matched_rack_ids
+            ]
+            if rack_scoped_candidates:
+                candidate_devices = rack_scoped_candidates
+
+        candidate_devices.sort(key=lambda device: len(device.name), reverse=True)
+        return candidate_devices[0]
 
     def find_racks_in_identifier(self, identifier_parts: List[str]) -> List[Rack]:
         if not identifier_parts:
