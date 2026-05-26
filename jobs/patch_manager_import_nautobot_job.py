@@ -37,6 +37,10 @@ DEFAULT_FIELDS = {
     "cable_description": "Cable Description",
     "connection_left": "Connections Left",
     "connection_right": "Connections Right",
+    "port_labeling_front": "Port Labeling Front",
+    "port_labeling_rear": "Port Labeling Rear",
+    "port_attributes_front": "Port Attributes Front",
+    "port_attributes_rear": "Port Attributes Rear",
 }
 
 SECRETS_GROUP_NAME = "PatchManagerAPI"
@@ -49,6 +53,16 @@ DEFAULT_LOCATION_TYPE_NAME = "Site"
 DEFAULT_STATUS_NAME = "Active"
 DEFAULT_DEVICE_ROLE_NAME = "Patch Manager Imported"
 DEFAULT_RACK_HEIGHT = 42
+
+PORT_DETAIL_FIELDS = (
+    "Port Labeling Front",
+    "Port Labeling Rear",
+    "Port Attributes Front",
+    "Port Attributes Rear",
+)
+
+PM_PORT_DETAILS_START = "## Patch Manager Port Details"
+PM_PORT_DETAILS_END = "## End Patch Manager Port Details"
 
 CONNECTION_SPLIT_RE = re.compile(r"\s*\|\s*|\s*;\s*")
 PM_TEMPLATE_BRACKET_RE = re.compile(r"\[[^\]]+\]")
@@ -164,7 +178,9 @@ class PatchManagerImport(Job):
                 self.import_racks(client.get_collection("cabinets", kwargs["rack_format"], self.page_size))
 
             if kwargs["import_mode"] in ("all", "inventory", "equipment"):
-                self.import_devices(client.get_collection("equipment", kwargs["device_format"], self.page_size))
+                equipment_rows = client.get_collection("equipment", kwargs["device_format"], self.page_size)
+                skipped_port_detail_rows = self.import_devices(equipment_rows)
+                self.apply_skipped_device_port_details(skipped_port_detail_rows)
 
             if kwargs["import_mode"] in ("all", "cables"):
                 self.import_cables(client.get_collection("cables", kwargs["cable_format"], self.page_size))
@@ -211,8 +227,9 @@ class PatchManagerImport(Job):
                 rack.u_height,
             )
 
-    def import_devices(self, rows: Iterable[Dict[str, Any]]) -> None:
+    def import_devices(self, rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         status = self.get_status()
+        skipped_port_detail_rows: List[Dict[str, Any]] = []
 
         for row in rows:
             name = self.clean(row.get(self.fields["device_name"]))
@@ -238,9 +255,10 @@ class PatchManagerImport(Job):
 
             if position is None:
                 self.logger.info(
-                    "Skipping device %s; no valid U position found in Equipment Position",
+                    "Cataloging skipped device %s; no valid U position found in Equipment Position",
                     name,
                 )
+                skipped_port_detail_rows.append(row)
                 continue
 
             existing_device = Device.objects.filter(name=name).first()
@@ -280,6 +298,100 @@ class PatchManagerImport(Job):
             )
 
             self.logger.info("%s device %s", "Created" if created else "Updated", device.name)
+
+        return skipped_port_detail_rows
+
+    def apply_skipped_device_port_details(self, rows: Iterable[Dict[str, Any]]) -> None:
+        details_by_device_id: Dict[int, List[Dict[str, str]]] = {}
+
+        for row in rows:
+            target_device = self.find_imported_device_in_identifier(
+                self.clean(row.get(self.fields["device_identifier"]))
+            )
+
+            if not target_device:
+                self.logger.info(
+                    "Skipping port detail row; could not find imported parent device from Equipment Identifier: %s",
+                    row.get(self.fields["device_identifier"]),
+                )
+                continue
+
+            details = self.extract_port_detail_fields(row)
+            if not details:
+                self.logger.info(
+                    "Skipping port detail row for %s; no port detail fields populated",
+                    target_device.name,
+                )
+                continue
+
+            details_by_device_id.setdefault(target_device.pk, []).append(details)
+
+        for device_id, detail_rows in details_by_device_id.items():
+            device = Device.objects.get(pk=device_id)
+            device.comments = self.replace_pm_port_details_block(device.comments or "", detail_rows)
+            device.validated_save()
+            self.logger.info("Updated Patch Manager port details on device %s", device.name)
+
+    def find_imported_device_in_identifier(self, value: str) -> Optional[Device]:
+        if not value:
+            return None
+
+        parts = [p.strip() for p in value.split(",") if p.strip()]
+
+        for part in reversed(parts):
+            device = Device.objects.filter(name=part).exclude(position__isnull=True).first()
+            if device:
+                return device
+
+        return None
+
+    def extract_port_detail_fields(self, row: Dict[str, Any]) -> Dict[str, str]:
+        details: Dict[str, str] = {}
+
+        field_map = {
+            self.fields["port_labeling_front"]: "Port Labeling Front",
+            self.fields["port_labeling_rear"]: "Port Labeling Rear",
+            self.fields["port_attributes_front"]: "Port Attributes Front",
+            self.fields["port_attributes_rear"]: "Port Attributes Rear",
+        }
+
+        for source_column, header in field_map.items():
+            value = self.clean(row.get(source_column))
+            if value:
+                details[header] = value
+
+        return details
+
+    def replace_pm_port_details_block(self, existing_comments: str, detail_rows: List[Dict[str, str]]) -> str:
+        base_comments = self.strip_pm_port_details_block(existing_comments).rstrip()
+        new_block = self.render_pm_port_details_block(detail_rows)
+
+        if base_comments:
+            return f"{base_comments}\n\n{new_block}"
+
+        return new_block
+
+    def strip_pm_port_details_block(self, comments: str) -> str:
+        pattern = re.compile(
+            rf"\n*{re.escape(PM_PORT_DETAILS_START)}.*?{re.escape(PM_PORT_DETAILS_END)}\n*",
+            re.DOTALL,
+        )
+        return pattern.sub("\n", comments or "").strip()
+
+    def render_pm_port_details_block(self, detail_rows: List[Dict[str, str]]) -> str:
+        lines = [PM_PORT_DETAILS_START]
+
+        for index, details in enumerate(detail_rows, start=1):
+            if len(detail_rows) > 1:
+                lines.append(f"### Entry {index}")
+
+            for header in PORT_DETAIL_FIELDS:
+                value = details.get(header)
+                if value:
+                    lines.extend([f"### {header}", value])
+
+        lines.append(PM_PORT_DETAILS_END)
+        return "\n".join(lines)
 
     def import_cables(self, rows: Iterable[Dict[str, Any]]) -> None:
         status = self.get_status()
