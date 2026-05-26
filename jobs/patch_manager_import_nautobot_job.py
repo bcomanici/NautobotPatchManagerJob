@@ -364,9 +364,12 @@ class PatchManagerImport(Job):
         rack-mounted Nautobot device.
 
         Matching rules:
-        - Equipment Identifier must contain an exact rack-name match.
-        - Within that matched rack, find a mounted device whose name is contained
-          somewhere in the Equipment Identifier text.
+        - Equipment Identifier must contain a rack reference that matches an
+          imported Nautobot rack after normalization.
+        - This handles Patch Manager forms like "Rack 301.09" matching imported
+          Nautobot rack names like "301.09 Rack".
+        - Within matched racks, find a mounted device whose normalized name is
+          contained somewhere in the normalized Equipment Identifier text.
         - Prefer the longest device-name match to avoid selecting a shorter,
           less-specific name when multiple devices match.
         """
@@ -375,17 +378,12 @@ class PatchManagerImport(Job):
 
         identifier = self.clean(value)
         identifier_parts = [p.strip() for p in identifier.split(",") if p.strip()]
-
-        matched_racks: List[Rack] = []
-        for part in identifier_parts:
-            rack = Rack.objects.filter(name=part).first()
-            if rack:
-                matched_racks.append(rack)
+        matched_racks = self.find_racks_in_identifier(identifier_parts)
 
         if not matched_racks:
             return None
 
-        identifier_lower = identifier.lower()
+        normalized_identifier = self.normalize_pm_match_text(identifier)
         matched_devices: List[Device] = []
 
         for rack in matched_racks:
@@ -395,7 +393,8 @@ class PatchManagerImport(Job):
             ).exclude(name="")
 
             for device in devices:
-                if device.name.lower() in identifier_lower:
+                normalized_device_name = self.normalize_pm_match_text(device.name)
+                if normalized_device_name and normalized_device_name in normalized_identifier:
                     matched_devices.append(device)
 
         if not matched_devices:
@@ -403,6 +402,62 @@ class PatchManagerImport(Job):
 
         matched_devices.sort(key=lambda device: len(device.name), reverse=True)
         return matched_devices[0]
+
+    def find_racks_in_identifier(self, identifier_parts: List[str]) -> List[Rack]:
+        if not identifier_parts:
+            return []
+
+        normalized_parts = [self.normalize_pm_match_text(part) for part in identifier_parts]
+        normalized_parts = [part for part in normalized_parts if part]
+
+        matched_racks: List[Rack] = []
+
+        for rack in Rack.objects.all():
+            normalized_rack_name = self.normalize_pm_match_text(rack.name)
+            if not normalized_rack_name:
+                continue
+
+            rack_name_variants = {
+                normalized_rack_name,
+                self.normalize_rack_name_order(normalized_rack_name),
+            }
+
+            for normalized_part in normalized_parts:
+                part_variants = {
+                    normalized_part,
+                    self.normalize_rack_name_order(normalized_part),
+                }
+
+                if rack_name_variants & part_variants:
+                    matched_racks.append(rack)
+                    break
+
+        return matched_racks
+
+    @staticmethod
+    def normalize_pm_match_text(value: str) -> str:
+        normalized = (value or "").replace("<COMMA>", ",")
+        normalized = re.sub(r"\s+", " ", normalized)
+        normalized = normalized.strip().lower()
+        return normalized
+
+    @staticmethod
+    def normalize_rack_name_order(value: str) -> str:
+        """
+        Normalize "Rack 301.09" and "301.09 Rack" to the same comparison form.
+        Leaves non-matching rack names unchanged.
+        """
+        normalized = re.sub(r"\s+", " ", value or "").strip().lower()
+
+        rack_prefix_match = re.match(r"^rack\s+(.+)$", normalized)
+        if rack_prefix_match:
+            return f"{rack_prefix_match.group(1).strip()} rack"
+
+        rack_suffix_match = re.match(r"^(.+)\s+rack$", normalized)
+        if rack_suffix_match:
+            return f"{rack_suffix_match.group(1).strip()} rack"
+
+        return normalized
 
     def extract_port_detail_fields(self, row: Dict[str, Any]) -> Dict[str, str]:
         details: Dict[str, str] = {}
