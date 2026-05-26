@@ -56,9 +56,9 @@ from urllib.parse import urlencode
 import requests
 from django.db import transaction
 from django.utils.text import slugify
-from nautobot.apps.jobs import BooleanVar, ChoiceVar, IntegerVar, Job, ObjectVar, StringVar
+from nautobot.apps.jobs import BooleanVar, ChoiceVar, IntegerVar, Job, StringVar
 from nautobot.dcim.models import Cable, Device, DeviceType, Interface, Location, LocationType, Manufacturer, Rack
-from nautobot.extras.models import SecretsGroup, Status
+from nautobot.extras.models import SecretsGroup, SecretsGroupAssociation, Status
 
 
 DEFAULT_FORMATS = {
@@ -155,14 +155,13 @@ class PatchManagerClient:
         return []
 
 
-# Expected Nautobot Secrets Group configuration:
-# Secrets Group Name: PatchManagerAPI
+# Expected Nautobot Secrets configuration:
+# - Secrets Group: PatchManagerAPI
+# - Secret name in that group: PatchManagerUser
+# - Secret name in that group: PatchManagerPassword
 #
-# Secret mappings:
-# - access_type=http, secret_type=username -> PatchManagerUser
-# - access_type=http, secret_type=password -> PatchManagerPassword
-#
-# The Job reads the credentials dynamically from the configured Secrets Group.
+# This job resolves the Secret records by name within the group, so the group's
+# access_type and secret_type labels do not need to be hard-coded in the job.
 #
 class PatchManagerImport(Job):
     """Import racks, devices, cables, and connections from Patch Manager."""
@@ -173,10 +172,6 @@ class PatchManagerImport(Job):
         has_sensitive_variables = True
 
     patch_manager_url = StringVar(description="Patch Manager base URL, for example https://patchmanager.example.org")
-    secrets_group = ObjectVar(
-        model=SecretsGroup,
-        description="Secrets Group containing PatchManagerUser and PatchManagerPassword secrets",
-    )
     verify_ssl = BooleanVar(default=True, description="Verify Patch Manager TLS certificate")
     dryrun = BooleanVar(default=True, description="Validate and log changes without writing to Nautobot")
     page_size = IntegerVar(default=500, min_value=1, max_value=5000)
@@ -196,9 +191,8 @@ class PatchManagerImport(Job):
     )
 
     def run(self, *args: Any, **kwargs: Any) -> None:
-        secrets_group = kwargs["secrets_group"]
-        username = secrets_group.get_secret_value(access_type="http", secret_type="username")
-        password = secrets_group.get_secret_value(access_type="http", secret_type="password")
+        username = self.get_secret_from_group("PatchManagerAPI", "PatchManagerUser")
+        password = self.get_secret_from_group("PatchManagerAPI", "PatchManagerPassword")
 
         client = PatchManagerClient(
             base_url=kwargs["patch_manager_url"],
@@ -314,6 +308,14 @@ class PatchManagerImport(Job):
                 description=self.clean(row.get(self.fields["cable_description"])),
             )
             self.logger.info("Created cable %s: %s:%s -> %s:%s", cable.label or cable.pk, left.device_name, left.port_name, right.device_name, right.port_name)
+
+    def get_secret_from_group(self, group_name: str, secret_name: str) -> str:
+        group = SecretsGroup.objects.get(name=group_name)
+        association = SecretsGroupAssociation.objects.select_related("secret").get(
+            secrets_group=group,
+            secret__name=secret_name,
+        )
+        return association.secret.get_value()
 
     def get_interface_for_endpoint(self, endpoint: PMEndpoint) -> Optional[Interface]:
         device = self.find_device(endpoint.device_name)
