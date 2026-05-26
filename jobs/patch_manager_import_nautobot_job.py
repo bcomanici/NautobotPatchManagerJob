@@ -56,9 +56,9 @@ from urllib.parse import urlencode
 import requests
 from django.db import transaction
 from django.utils.text import slugify
-from nautobot.apps.jobs import BooleanVar, ChoiceVar, IntegerVar, Job, StringVar
+from nautobot.apps.jobs import BooleanVar, ChoiceVar, IntegerVar, Job, ObjectVar, StringVar
 from nautobot.dcim.models import Cable, Device, DeviceType, Interface, Location, LocationType, Manufacturer, Rack
-from nautobot.extras.models import Status
+from nautobot.extras.models import SecretsGroup, Status
 
 
 DEFAULT_FORMATS = {
@@ -155,6 +155,15 @@ class PatchManagerClient:
         return []
 
 
+# Expected Nautobot Secrets Group configuration:
+# Secrets Group Name: PatchManagerAPI
+#
+# Secret mappings:
+# - access_type=http, secret_type=username -> PatchManagerUser
+# - access_type=http, secret_type=password -> PatchManagerPassword
+#
+# The Job reads the credentials dynamically from the configured Secrets Group.
+#
 class PatchManagerImport(Job):
     """Import racks, devices, cables, and connections from Patch Manager."""
 
@@ -164,8 +173,10 @@ class PatchManagerImport(Job):
         has_sensitive_variables = True
 
     patch_manager_url = StringVar(description="Patch Manager base URL, for example https://patchmanager.example.org")
-    username = StringVar(description="Patch Manager REST username")
-    password = StringVar(description="Patch Manager REST password", is_password=True)
+    secrets_group = ObjectVar(
+        model=SecretsGroup,
+        description="Secrets Group containing PatchManagerUser and PatchManagerPassword secrets",
+    )
     verify_ssl = BooleanVar(default=True, description="Verify Patch Manager TLS certificate")
     dryrun = BooleanVar(default=True, description="Validate and log changes without writing to Nautobot")
     page_size = IntegerVar(default=500, min_value=1, max_value=5000)
@@ -185,10 +196,14 @@ class PatchManagerImport(Job):
     )
 
     def run(self, *args: Any, **kwargs: Any) -> None:
+        secrets_group = kwargs["secrets_group"]
+        username = secrets_group.get_secret_value(access_type="http", secret_type="username")
+        password = secrets_group.get_secret_value(access_type="http", secret_type="password")
+
         client = PatchManagerClient(
             base_url=kwargs["patch_manager_url"],
-            username=kwargs["username"],
-            password=kwargs["password"],
+            username=username,
+            password=password,
             verify_ssl=kwargs["verify_ssl"],
         )
         self.dryrun = kwargs["dryrun"]
