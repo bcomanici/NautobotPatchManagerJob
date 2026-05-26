@@ -306,63 +306,24 @@ class PatchManagerImport(Job):
                     defaults=device_defaults,
                 )
             except ValidationError as exc:
-                message_dict = getattr(exc, "message_dict", {})
-
-                if "position" in message_dict:
-                    self.logger.warning(
-                        "Rack position validation failed for %s at rack=%s position=%s face=%s: %s. "
-                        "Retrying import with rack assigned but without rack position.",
-                        name,
-                        rack.name if rack else None,
-                        position,
-                        face,
-                        exc,
-                    )
-
-                    device_defaults["position"] = None
-
-                    try:
-                        device, created = Device.objects.update_or_create(
-                            name=name,
-                            defaults=device_defaults,
-                        )
-                    except ValidationError as retry_exc:
-                        retry_message_dict = getattr(retry_exc, "message_dict", {})
-                        if "face" not in retry_message_dict:
-                            raise
-
-                        self.logger.warning(
-                            "Rack face validation failed for %s after clearing position: %s. "
-                            "Retrying import with blank rack face.",
-                            name,
-                            retry_exc,
-                        )
-
-                        device_defaults["face"] = ""
-                        device, created = Device.objects.update_or_create(
-                            name=name,
-                            defaults=device_defaults,
-                        )
-
-                elif "face" in message_dict:
-                    self.logger.warning(
-                        "Rack face validation failed for %s at rack=%s position=%s face=%s: %s. "
-                        "Retrying import with blank rack face.",
-                        name,
-                        rack.name if rack else None,
-                        position,
-                        face,
-                        exc,
-                    )
-
-                    device_defaults["face"] = ""
-                    device, created = Device.objects.update_or_create(
-                        name=name,
-                        defaults=device_defaults,
-                    )
-
-                else:
+                if "position" not in getattr(exc, "message_dict", {}):
                     raise
+
+                self.logger.warning(
+                    "Rack position validation failed for %s at rack=%s position=%s face=%s: %s. "
+                    "Retrying import without rack position.",
+                    name,
+                    rack.name if rack else None,
+                    position,
+                    face,
+                    exc,
+                )
+
+                device_defaults["position"] = None
+                device, created = Device.objects.update_or_create(
+                    name=name,
+                    defaults=device_defaults,
+                )
 
             self.logger.info("%s device %s", "Created" if created else "Updated", device.name)
 
@@ -405,12 +366,15 @@ class PatchManagerImport(Job):
         rack-mounted Nautobot device.
 
         Matching order:
-        1. Preferred: rack-normalized match, then device-name containment inside
-           that matched rack.
-        2. Conservative fallback: exact comma-separated Equipment Identifier
-           token equals an existing mounted Nautobot device name. If multiple
-           devices have that same name, prefer the one in a rack hinted by the
-           Equipment Identifier.
+        1. Existing known-good behavior: Equipment Identifier must contain a rack
+           reference matching an imported Nautobot rack after normalization, then
+           a mounted device in that rack must have a normalized name contained
+           somewhere in the identifier.
+        2. Conservative fallback: if the rack-scoped match fails, look for an
+           exact comma-separated Equipment Identifier token that matches an
+           existing mounted Nautobot device name. This helps rows where the
+           device name is explicit but the rack text is not normalized the same
+           way as the imported rack name.
         """
         if not value:
             return None
@@ -436,17 +400,6 @@ class PatchManagerImport(Job):
                 fallback_match.name,
             )
             return fallback_match
-
-        if not matched_racks:
-            self.logger.info(
-                "Port detail match failed before device lookup; no rack matched identifier: %s",
-                identifier,
-            )
-        else:
-            self.logger.info(
-                "Port detail match failed after rack match; no mounted device name found in identifier: %s",
-                identifier,
-            )
 
         return None
 
