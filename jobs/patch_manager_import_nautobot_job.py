@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlencode
 
 import requests
@@ -25,17 +25,14 @@ DEFAULT_FORMATS = {
 DEFAULT_FIELDS = {
     "rack_name": "Cabinet Name",
     "rack_location": "Cabinet Location",
-    "rack_template": "Cabinet Template",
     "rack_description": "Cabinet Description",
     "device_name": "Equipment Label",
     "device_identifier": "Equipment Identifier",
     "device_type": "Equipment Template",
     "device_rack": "Equipment Position Cabinet",
     "device_location": "Equipment Location",
-    "device_position": "Equipment Position",
     "device_description": "Equipment Description",
     "cable_label": "Cable Label",
-    "cable_type": "Cable Template",
     "cable_description": "Cable Description",
     "connection_left": "Connections Left",
     "connection_right": "Connections Right",
@@ -95,8 +92,7 @@ class PatchManagerClient:
                     response=response,
                 )
 
-            payload = response.json()
-            batch = self._normalize_collection(payload, resource)
+            batch = self._normalize_collection(response.json(), resource)
             rows.extend(batch)
 
             if len(batch) < limit:
@@ -168,17 +164,11 @@ class PatchManagerImport(Job):
 
         with transaction.atomic():
             if kwargs["import_mode"] in ("all", "inventory"):
-                self.import_racks(
-                    client.get_collection("cabinets", kwargs["rack_format"], self.page_size)
-                )
-                self.import_devices(
-                    client.get_collection("equipment", kwargs["device_format"], self.page_size)
-                )
+                self.import_racks(client.get_collection("cabinets", kwargs["rack_format"], self.page_size))
+                self.import_devices(client.get_collection("equipment", kwargs["device_format"], self.page_size))
 
             if kwargs["import_mode"] in ("all", "cables"):
-                self.import_cables(
-                    client.get_collection("cables", kwargs["cable_format"], self.page_size)
-                )
+                self.import_cables(client.get_collection("cables", kwargs["cable_format"], self.page_size))
 
             if self.dryrun:
                 self.logger.warning("Dry run enabled; rolling back all database changes.")
@@ -229,7 +219,6 @@ class PatchManagerImport(Job):
             device_type = self.get_or_create_device_type(
                 self.clean(row.get(self.fields["device_type"]))
             )
-
             role = self.get_or_create_device_role(identifier_data["role"])
 
             rack = self.find_rack_from_names(identifier_data["racks"])
@@ -245,13 +234,6 @@ class PatchManagerImport(Job):
                     or "Patch Manager"
                 )
 
-            # IMPORTANT:
-            # Do not import Patch Manager rack U positions.
-            # Patch Manager has duplicate rack/position/face values.
-            # Nautobot enforces uniqueness on rack + position + face.
-            position = None
-            face = "front"
-
             device, created = Device.objects.update_or_create(
                 name=name,
                 defaults={
@@ -260,8 +242,10 @@ class PatchManagerImport(Job):
                     "status": status,
                     "location": location,
                     "rack": rack,
-                    "position": position,
-                    "face": face,
+                    # Do not import Patch Manager U positions.
+                    # Nautobot enforces unique rack + position + face.
+                    "position": None,
+                    "face": "front",
                     "comments": (
                         self.clean(row.get(self.fields["device_description"]))
                         or identifier_data["address"]
@@ -269,11 +253,7 @@ class PatchManagerImport(Job):
                 },
             )
 
-            self.logger.info(
-                "%s device %s",
-                "Created" if created else "Updated",
-                device.name,
-            )
+            self.logger.info("%s device %s", "Created" if created else "Updated", device.name)
 
     def import_cables(self, rows: Iterable[Dict[str, Any]]) -> None:
         status = self.get_status()
@@ -344,11 +324,21 @@ class PatchManagerImport(Job):
         if not device:
             return None
 
+        status = self.get_status()
+
         interface, _ = Interface.objects.get_or_create(
             device=device,
             name=endpoint.port_name,
-            defaults={"type": PORT_TYPE_DEFAULT},
+            defaults={
+                "type": PORT_TYPE_DEFAULT,
+                "status": status,
+            },
         )
+
+        if not interface.status_id:
+            interface.status = status
+            interface.validated_save()
+
         return interface
 
     def parse_endpoint(self, value: str) -> Optional[PMEndpoint]:
@@ -409,9 +399,7 @@ class PatchManagerImport(Job):
 
     def get_or_create_device_type(self, name: str) -> DeviceType:
         clean_name = name or "Unknown Patch Manager Equipment"
-        manufacturer, _ = Manufacturer.objects.get_or_create(
-            name=DEFAULT_MANUFACTURER_NAME
-        )
+        manufacturer, _ = Manufacturer.objects.get_or_create(name=DEFAULT_MANUFACTURER_NAME)
 
         device_type, _ = DeviceType.objects.get_or_create(
             manufacturer=manufacturer,
