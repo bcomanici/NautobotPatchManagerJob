@@ -385,11 +385,19 @@ class PatchManagerImport(Job):
                 )
             )
 
+            # Ignore equipment rows without a valid U position.
+            if position is None:
+                self.logger.info(
+                    "Skipping device %s; no valid U position found in Equipment Position",
+                    name,
+                )
+                continue
+
             existing_device = Device.objects.filter(
                 name=name
             ).first()
 
-            if rack and position is not None:
+            if rack:
 
                 conflict_qs = Device.objects.filter(
                     rack=rack,
