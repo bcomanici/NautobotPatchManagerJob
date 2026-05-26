@@ -306,24 +306,63 @@ class PatchManagerImport(Job):
                     defaults=device_defaults,
                 )
             except ValidationError as exc:
-                if "position" not in getattr(exc, "message_dict", {}):
+                message_dict = getattr(exc, "message_dict", {})
+
+                if "position" in message_dict:
+                    self.logger.warning(
+                        "Rack position validation failed for %s at rack=%s position=%s face=%s: %s. "
+                        "Retrying import with rack assigned but without rack position.",
+                        name,
+                        rack.name if rack else None,
+                        position,
+                        face,
+                        exc,
+                    )
+
+                    device_defaults["position"] = None
+
+                    try:
+                        device, created = Device.objects.update_or_create(
+                            name=name,
+                            defaults=device_defaults,
+                        )
+                    except ValidationError as retry_exc:
+                        retry_message_dict = getattr(retry_exc, "message_dict", {})
+                        if "face" not in retry_message_dict:
+                            raise
+
+                        self.logger.warning(
+                            "Rack face validation failed for %s after clearing position: %s. "
+                            "Retrying import with blank rack face.",
+                            name,
+                            retry_exc,
+                        )
+
+                        device_defaults["face"] = ""
+                        device, created = Device.objects.update_or_create(
+                            name=name,
+                            defaults=device_defaults,
+                        )
+
+                elif "face" in message_dict:
+                    self.logger.warning(
+                        "Rack face validation failed for %s at rack=%s position=%s face=%s: %s. "
+                        "Retrying import with blank rack face.",
+                        name,
+                        rack.name if rack else None,
+                        position,
+                        face,
+                        exc,
+                    )
+
+                    device_defaults["face"] = ""
+                    device, created = Device.objects.update_or_create(
+                        name=name,
+                        defaults=device_defaults,
+                    )
+
+                else:
                     raise
-
-                self.logger.warning(
-                    "Rack position validation failed for %s at rack=%s position=%s face=%s: %s. "
-                    "Retrying import without rack position.",
-                    name,
-                    rack.name if rack else None,
-                    position,
-                    face,
-                    exc,
-                )
-
-                device_defaults["position"] = None
-                device, created = Device.objects.update_or_create(
-                    name=name,
-                    defaults=device_defaults,
-                )
 
             self.logger.info("%s device %s", "Created" if created else "Updated", device.name)
 
