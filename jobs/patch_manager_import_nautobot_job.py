@@ -56,9 +56,11 @@ from nautobot.extras.models import SecretsGroup, SecretsGroupAssociation, Status
 
 
 DEFAULT_FORMATS = {
-    "rack_format": "Nautobot Rack Import",
-    "device_format": "Nautobot Device Import",
-    "cable_format": "Nautobot Cable Import",
+    # Empty string means do not send the format query parameter.
+    # Patch Manager then uses its default Standard format for the resource.
+    "rack_format": "Cabinet Export",
+    "device_format": "Equipment Export",
+    "cable_format": "Cable Export",
 }
 
 DEFAULT_FIELDS = {
@@ -116,7 +118,9 @@ class PatchManagerClient:
         rows: List[Dict[str, Any]] = []
         start = 0
         while True:
-            params = {"format": fmt, "start": start, "limit": limit}
+            params = {"start": start, "limit": limit}
+            if fmt:
+                params["format"] = fmt
             url = f"{self.base_url}/rest/{resource}?{urlencode(params)}"
             response = self.session.get(url, timeout=self.timeout)
             if response.status_code >= 400:
@@ -125,7 +129,7 @@ class PatchManagerClient:
                     hint = (
                         " Hint: Patch Manager returned 400 for a formatted GET. "
                         "Verify that the named data format exists and is the correct resource type "
-                        "for this endpoint, for example a Ports data format for /rest/ports."
+                        "for this endpoint, for example a Cabinets data format for /rest/cabinets."
                     )
                 raise requests.HTTPError(
                     f"{response.status_code} Client Error for url: {url}; response body: {response.text[:1000]}{hint}",
@@ -178,15 +182,15 @@ class PatchManagerImport(Job):
 
     rack_format = StringVar(
         default=DEFAULT_FORMATS["rack_format"],
-        description="Patch Manager Cabinets data format. Use Standard to test connectivity if the custom format is not created yet.",
+        description="Optional Patch Manager Cabinets data format. Leave blank to use Patch Manager's default Standard format.",
     )
     device_format = StringVar(
         default=DEFAULT_FORMATS["device_format"],
-        description="Patch Manager Equipment data format. Use Standard to test connectivity if the custom format is not created yet.",
+        description="Optional Patch Manager Equipment data format. Leave blank to use Patch Manager's default Standard format.",
     )
     cable_format = StringVar(
         default=DEFAULT_FORMATS["cable_format"],
-        description="Patch Manager Cables data format. Use Standard to test connectivity if the custom format is not created yet.",
+        description="Optional Patch Manager Cables data format. Leave blank to use Patch Manager's default Standard format.",
     )
     import_mode = ChoiceVar(
         choices=(
