@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
+from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from nautobot.apps.jobs import BooleanVar, ChoiceVar, IntegerVar, Job, StringVar
 from nautobot.dcim.models import Cable, Device, DeviceType, Interface, Location, LocationType, Manufacturer, Rack
@@ -333,17 +334,50 @@ class PatchManagerImport(Job):
             self.logger.info("Updated Patch Manager port details on device %s", device.name)
 
     def find_imported_device_in_identifier(self, value: str) -> Optional[Device]:
+        """
+        Resolve a skipped Patch Manager equipment row back to an already-imported,
+        rack-mounted Nautobot device.
+
+        Matching rules:
+        - Equipment Identifier must contain an exact rack-name match.
+        - Within that matched rack, find a mounted device whose name is contained
+          somewhere in the Equipment Identifier text.
+        - Prefer the longest device-name match to avoid selecting a shorter,
+          less-specific name when multiple devices match.
+        """
         if not value:
             return None
 
-        parts = [p.strip() for p in value.split(",") if p.strip()]
+        identifier = self.clean(value)
+        identifier_parts = [p.strip() for p in identifier.split(",") if p.strip()]
 
-        for part in reversed(parts):
-            device = Device.objects.filter(name=part).exclude(position__isnull=True).first()
-            if device:
-                return device
+        matched_racks: List[Rack] = []
+        for part in identifier_parts:
+            rack = Rack.objects.filter(name=part).first()
+            if rack:
+                matched_racks.append(rack)
 
-        return None
+        if not matched_racks:
+            return None
+
+        identifier_lower = identifier.lower()
+        matched_devices: List[Device] = []
+
+        for rack in matched_racks:
+            devices = Device.objects.filter(
+                rack=rack,
+                position__isnull=False,
+            ).exclude(name="")
+
+            for device in devices:
+                if device.name.lower() in identifier_lower:
+                    matched_devices.append(device)
+
+        if not matched_devices:
+            return None
+
+        matched_devices.sort(key=lambda device: len(device.name), reverse=True)
+        return matched_devices[0]
 
     def extract_port_detail_fields(self, row: Dict[str, Any]) -> Dict[str, str]:
         details: Dict[str, str] = {}
@@ -555,6 +589,7 @@ class PatchManagerImport(Job):
             name=DEFAULT_LOCATION_TYPE_NAME,
             defaults={"nestable": True},
         )
+        self.ensure_location_type_content_types(location_type)
 
         location, _ = Location.objects.get_or_create(
             name=name,
@@ -571,6 +606,27 @@ class PatchManagerImport(Job):
 
         return location
 
+    def ensure_location_type_content_types(self, location_type: LocationType) -> None:
+        """
+        Nautobot validates whether a LocationType may contain specific object
+        types. Imported racks and devices need the selected LocationType to
+        allow Rack and Device assignments.
+        """
+        required_content_types = [
+            ContentType.objects.get_for_model(Rack),
+            ContentType.objects.get_for_model(Device),
+        ]
+
+        for content_type in required_content_types:
+            location_type.content_types.add(content_type)
+
+    def ensure_role_content_types(self, role: Role) -> None:
+        """
+        Nautobot validates Role choices by content type. Imported device roles
+        must be enabled for Device objects before assigning them to Device.role.
+        """
+        role.content_types.add(ContentType.objects.get_for_model(Device))
+
     def get_or_create_device_type(self, name: str) -> DeviceType:
         clean_name = name or "Unknown Patch Manager Equipment"
         manufacturer, _ = Manufacturer.objects.get_or_create(name=DEFAULT_MANUFACTURER_NAME)
@@ -585,6 +641,7 @@ class PatchManagerImport(Job):
     def get_or_create_device_role(self, name: str) -> Role:
         role_name = name or DEFAULT_DEVICE_ROLE_NAME
         role, _ = Role.objects.get_or_create(name=role_name)
+        self.ensure_role_content_types(role)
         return role
 
     def get_status(self) -> Status:
