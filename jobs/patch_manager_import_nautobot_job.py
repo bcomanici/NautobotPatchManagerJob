@@ -244,7 +244,7 @@ class PatchManagerImport(Job):
                 location=location,
                 defaults={
                     "status": status,
-                    "description": self.clean(row.get(self.fields["rack_description"])),
+                    "comments": self.clean(row.get(self.fields["rack_description"])),
                 },
             )
             self.logger.info("%s rack %s", "Created" if created else "Updated", rack)
@@ -298,7 +298,7 @@ class PatchManagerImport(Job):
                 termination_b=right_if,
                 status=status,
                 label=label,
-                description=self.clean(row.get(self.fields["cable_description"])),
+                comments=self.clean(row.get(self.fields["cable_description"])),
             )
             self.logger.info("Created cable %s: %s:%s -> %s:%s", cable.label or cable.pk, left.device_name, left.port_name, right.device_name, right.port_name)
 
