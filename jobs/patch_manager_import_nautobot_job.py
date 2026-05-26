@@ -130,7 +130,11 @@ class PatchManagerClient:
             params = {"format": fmt, "start": start, "limit": limit}
             url = f"{self.base_url}/rest/{resource}?{urlencode(params)}"
             response = self.session.get(url, timeout=self.timeout)
-            response.raise_for_status()
+            if response.status_code >= 400:
+                raise requests.HTTPError(
+                    f"{response.status_code} Client Error for url: {url}; response body: {response.text[:1000]}",
+                    response=response,
+                )
             payload = response.json()
 
             batch = self._normalize_collection(payload, resource)
@@ -176,10 +180,22 @@ class PatchManagerImport(Job):
     dryrun = BooleanVar(default=True, description="Validate and log changes without writing to Nautobot")
     page_size = IntegerVar(default=500, min_value=1, max_value=5000)
 
-    rack_format = StringVar(default=DEFAULT_FORMATS["rack_format"])
-    device_format = StringVar(default=DEFAULT_FORMATS["device_format"])
-    cable_format = StringVar(default=DEFAULT_FORMATS["cable_format"])
-    port_format = StringVar(default=DEFAULT_FORMATS["port_format"])
+    rack_format = StringVar(
+        default=DEFAULT_FORMATS["rack_format"],
+        description="Patch Manager Cabinets data format. Use Standard to test connectivity if the custom format is not created yet.",
+    )
+    device_format = StringVar(
+        default=DEFAULT_FORMATS["device_format"],
+        description="Patch Manager Equipment data format. Use Standard to test connectivity if the custom format is not created yet.",
+    )
+    cable_format = StringVar(
+        default=DEFAULT_FORMATS["cable_format"],
+        description="Patch Manager Cables data format. Use Standard to test connectivity if the custom format is not created yet.",
+    )
+    port_format = StringVar(
+        default=DEFAULT_FORMATS["port_format"],
+        description="Patch Manager Ports data format. Use Standard to test connectivity if the custom format is not created yet.",
+    )
 
     import_mode = ChoiceVar(
         choices=(
