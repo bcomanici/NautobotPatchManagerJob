@@ -12,22 +12,8 @@ from urllib.parse import urlencode
 import requests
 from django.db import transaction
 from nautobot.apps.jobs import BooleanVar, ChoiceVar, IntegerVar, Job, StringVar
-from nautobot.dcim.models import (
-    Cable,
-    Device,
-    DeviceType,
-    Interface,
-    Location,
-    LocationType,
-    Manufacturer,
-    Rack,
-)
-from nautobot.extras.models import (
-    Role,
-    SecretsGroup,
-    SecretsGroupAssociation,
-    Status,
-)
+from nautobot.dcim.models import Cable, Device, DeviceType, Interface, Location, LocationType, Manufacturer, Rack
+from nautobot.extras.models import Role, SecretsGroup, SecretsGroupAssociation, Status
 
 
 DEFAULT_FORMATS = {
@@ -40,6 +26,7 @@ DEFAULT_FIELDS = {
     "rack_name": "Cabinet Name",
     "rack_identifier": "Cabinet Identifier",
     "rack_location": "Cabinet Location",
+    "rack_template": "Cabinet Template",
     "rack_description": "Cabinet Description",
     "device_name": "Equipment Label",
     "device_identifier": "Equipment Identifier",
@@ -61,6 +48,7 @@ DEFAULT_MANUFACTURER_NAME = "Patch Manager"
 DEFAULT_LOCATION_TYPE_NAME = "Site"
 DEFAULT_STATUS_NAME = "Active"
 DEFAULT_DEVICE_ROLE_NAME = "Patch Manager Imported"
+DEFAULT_RACK_HEIGHT = 42
 
 CONNECTION_SPLIT_RE = re.compile(r"\s*\|\s*|\s*;\s*")
 PM_TEMPLATE_BRACKET_RE = re.compile(r"\[[^\]]+\]")
@@ -191,6 +179,7 @@ class PatchManagerImport(Job):
         for row in rows:
             name = self.clean(row.get(self.fields["rack_name"]))
             identifier = self.clean(row.get(self.fields["rack_identifier"]))
+            rack_template = self.clean(row.get(self.fields["rack_template"]))
 
             if not name:
                 self.logger.warning("Skipping rack without name: %s", row)
@@ -201,6 +190,7 @@ class PatchManagerImport(Job):
                 if len(identifier_parts) > 1:
                     name = f"{identifier_parts[1]} {name}"
 
+            u_height = self.parse_rack_height(rack_template)
             location_name = self.clean(row.get(self.fields["rack_location"])) or "Patch Manager"
             location = self.get_or_create_location(location_name)
 
@@ -209,11 +199,17 @@ class PatchManagerImport(Job):
                 location=location,
                 defaults={
                     "status": status,
+                    "u_height": u_height,
                     "comments": self.clean(row.get(self.fields["rack_description"])),
                 },
             )
 
-            self.logger.info("%s rack %s", "Created" if created else "Updated", rack.name)
+            self.logger.info(
+                "%s rack %s (%sU)",
+                "Created" if created else "Updated",
+                rack.name,
+                rack.u_height,
+            )
 
     def import_devices(self, rows: Iterable[Dict[str, Any]]) -> None:
         status = self.get_status()
@@ -224,9 +220,7 @@ class PatchManagerImport(Job):
                 self.logger.warning("Skipping device without Equipment Label: %s", row)
                 continue
 
-            identifier_data = self.parse_equipment_identifier(
-                self.clean(row.get(self.fields["device_identifier"]))
-            )
+            identifier_data = self.parse_equipment_identifier(self.clean(row.get(self.fields["device_identifier"])))
 
             device_type = self.get_or_create_device_type(self.clean(row.get(self.fields["device_type"])))
             role = self.get_or_create_device_role(identifier_data["role"])
@@ -353,6 +347,17 @@ class PatchManagerImport(Job):
 
         return position, face
 
+    @staticmethod
+    def parse_rack_height(value: str) -> int:
+        if not value:
+            return DEFAULT_RACK_HEIGHT
+
+        match = re.search(r"(\d+)\s*U", value, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+
+        return DEFAULT_RACK_HEIGHT
+
     def get_secret_from_group(self, group_name: str, secret_name: str) -> str:
         group = SecretsGroup.objects.get(name=group_name)
         association = SecretsGroupAssociation.objects.select_related("secret").get(
@@ -364,7 +369,6 @@ class PatchManagerImport(Job):
 
     def get_interface_for_endpoint(self, endpoint: PMEndpoint) -> Optional[Interface]:
         device = self.find_device(endpoint.device_name)
-
         if not device:
             return None
 
@@ -390,7 +394,6 @@ class PatchManagerImport(Job):
             return None
 
         candidates = [x for x in CONNECTION_SPLIT_RE.split(value) if x and x != "|"]
-
         if not candidates:
             return None
 
@@ -474,10 +477,8 @@ class PatchManagerImport(Job):
 
     def get_status(self) -> Status:
         status = Status.objects.filter(name=DEFAULT_STATUS_NAME).first()
-
         if not status:
             raise RuntimeError(f"Nautobot status {DEFAULT_STATUS_NAME!r} was not found.")
-
         return status
 
     @staticmethod
