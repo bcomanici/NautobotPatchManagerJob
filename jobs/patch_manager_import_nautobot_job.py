@@ -435,7 +435,7 @@ class PatchManagerImport(Job):
             face = "front"
 
         return position, face
-
+#
     @staticmethod
     def clean(value: Any) -> str:
         return "" if value is None else str(value).strip()
