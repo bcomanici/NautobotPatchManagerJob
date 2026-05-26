@@ -38,6 +38,7 @@ DEFAULT_FORMATS = {
 
 DEFAULT_FIELDS = {
     "rack_name": "Cabinet Name",
+    "rack_identifier": "Cabinet Identifier",
     "rack_location": "Cabinet Location",
     "rack_description": "Cabinet Description",
     "device_name": "Equipment Label",
@@ -292,12 +293,34 @@ class PatchManagerImport(Job):
                 row.get(self.fields["rack_name"])
             )
 
+            identifier = self.clean(
+                row.get(self.fields["rack_identifier"])
+            )
+
             if not name:
                 self.logger.warning(
                     "Skipping rack without name: %s",
                     row,
                 )
                 continue
+
+            # If rack name starts with "Rack",
+            # prepend second item from Cabinet Identifier.
+            #
+            # Example:
+            # NYSERNet,Geneva + Rack
+            # => Geneva Rack
+
+            if name.lower().startswith("rack") and identifier:
+
+                identifier_parts = [
+                    p.strip()
+                    for p in identifier.split(",")
+                    if p.strip()
+                ]
+
+                if len(identifier_parts) > 1:
+                    name = f"{identifier_parts[1]} {name}"
 
             location_name = (
                 self.clean(
@@ -385,7 +408,7 @@ class PatchManagerImport(Job):
                 )
             )
 
-            # Ignore equipment rows without a valid U position.
+            # Ignore equipment rows without valid U position.
             if position is None:
                 self.logger.info(
                     "Skipping device %s; no valid U position found in Equipment Position",
