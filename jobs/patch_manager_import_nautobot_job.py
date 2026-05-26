@@ -288,7 +288,7 @@ class PatchManagerImport(Job):
                         conflicting_device.name,
                     )
                     position = None
-                    face = None
+                    face = "front"
 
             device_defaults = {
                 "device_type": device_type,
@@ -297,7 +297,7 @@ class PatchManagerImport(Job):
                 "location": location,
                 "rack": rack,
                 "position": position,
-                "face": face if rack and position is not None else None,
+                "face": face or "front",
                 "comments": self.clean(row.get(self.fields["device_description"])) or identifier_data["address"],
             }
 
@@ -307,25 +307,68 @@ class PatchManagerImport(Job):
                     defaults=device_defaults,
                 )
             except ValidationError as exc:
-                if "position" not in getattr(exc, "message_dict", {}):
+                message_dict = getattr(exc, "message_dict", {})
+
+                if "position" in message_dict:
+                    self.logger.warning(
+                        "Rack position validation failed for %s at rack=%s position=%s face=%s: %s. "
+                        "Retrying import without rack position.",
+                        name,
+                        rack.name if rack else None,
+                        position,
+                        face,
+                        exc,
+                    )
+
+                    device_defaults["position"] = None
+                    device_defaults["face"] = "front"
+
+                    try:
+                        device, created = Device.objects.update_or_create(
+                            name=name,
+                            defaults=device_defaults,
+                        )
+                    except ValidationError as retry_exc:
+                        retry_message_dict = getattr(retry_exc, "message_dict", {})
+                        if "face" not in retry_message_dict:
+                            raise
+
+                        self.logger.warning(
+                            "Rack face validation failed for %s after clearing position: %s. "
+                            "Retrying import without rack or rack position.",
+                            name,
+                            retry_exc,
+                        )
+
+                        device_defaults["rack"] = None
+                        device_defaults["position"] = None
+                        device_defaults["face"] = "front"
+                        device, created = Device.objects.update_or_create(
+                            name=name,
+                            defaults=device_defaults,
+                        )
+
+                elif "face" in message_dict:
+                    self.logger.warning(
+                        "Rack face validation failed for %s at rack=%s position=%s face=%s: %s. "
+                        "Retrying import without rack or rack position.",
+                        name,
+                        rack.name if rack else None,
+                        position,
+                        face,
+                        exc,
+                    )
+
+                    device_defaults["rack"] = None
+                    device_defaults["position"] = None
+                    device_defaults["face"] = "front"
+                    device, created = Device.objects.update_or_create(
+                        name=name,
+                        defaults=device_defaults,
+                    )
+
+                else:
                     raise
-
-                self.logger.warning(
-                    "Rack position validation failed for %s at rack=%s position=%s face=%s: %s. "
-                    "Retrying import without rack position.",
-                    name,
-                    rack.name if rack else None,
-                    position,
-                    face,
-                    exc,
-                )
-
-                device_defaults["position"] = None
-                device_defaults["face"] = None
-                device, created = Device.objects.update_or_create(
-                    name=name,
-                    defaults=device_defaults,
-                )
 
             self.logger.info("%s device %s", "Created" if created else "Updated", device.name)
 
