@@ -7,8 +7,8 @@ Assumptions
 - Patch Manager data formats exist and expose the fields configured below.
 - Patch Manager cabinets map to Nautobot Racks.
 - Patch Manager equipment maps to Nautobot Devices.
-- Patch Manager ports map to Nautobot Interfaces unless a port role map says otherwise.
 - Patch Manager cables map to Nautobot Cables, using the left/right connection fields from the cable format.
+- No /rest/ports request is made; interfaces are created on demand from cable endpoint strings.
 
 Recommended Patch Manager data formats
 --------------------------------------
@@ -38,12 +38,6 @@ Cable format:
 - Connections Left
 - Connections Right
 
-Port format:
-- Entity Id
-- Port Label
-- Port Qualified Name
-- Parent Equipment
-- Port Template
 """
 
 from __future__ import annotations
@@ -65,7 +59,6 @@ DEFAULT_FORMATS = {
     "rack_format": "Nautobot Rack Import",
     "device_format": "Nautobot Device Import",
     "cable_format": "Nautobot Cable Import",
-    "port_format": "Nautobot Port Import",
 }
 
 DEFAULT_FIELDS = {
@@ -84,10 +77,6 @@ DEFAULT_FIELDS = {
     "cable_description": "Cable Description",
     "connection_left": "Connections Left",
     "connection_right": "Connections Right",
-    "port_name": "Port Label",
-    "port_qname": "Port Qualified Name",
-    "port_parent_device": "Parent Equipment",
-    "port_template": "Port Template",
 }
 
 PORT_TYPE_DEFAULT = "1000base-t"
@@ -131,8 +120,15 @@ class PatchManagerClient:
             url = f"{self.base_url}/rest/{resource}?{urlencode(params)}"
             response = self.session.get(url, timeout=self.timeout)
             if response.status_code >= 400:
+                hint = ""
+                if response.status_code == 400 and "format=" in url:
+                    hint = (
+                        " Hint: Patch Manager returned 400 for a formatted GET. "
+                        "Verify that the named data format exists and is the correct resource type "
+                        "for this endpoint, for example a Ports data format for /rest/ports."
+                    )
                 raise requests.HTTPError(
-                    f"{response.status_code} Client Error for url: {url}; response body: {response.text[:1000]}",
+                    f"{response.status_code} Client Error for url: {url}; response body: {response.text[:1000]}{hint}",
                     response=response,
                 )
             payload = response.json()
@@ -192,15 +188,10 @@ class PatchManagerImport(Job):
         default=DEFAULT_FORMATS["cable_format"],
         description="Patch Manager Cables data format. Use Standard to test connectivity if the custom format is not created yet.",
     )
-    port_format = StringVar(
-        default=DEFAULT_FORMATS["port_format"],
-        description="Patch Manager Ports data format. Use Standard to test connectivity if the custom format is not created yet.",
-    )
-
     import_mode = ChoiceVar(
         choices=(
-            ("all", "Racks, devices, interfaces, cables"),
-            ("inventory", "Racks, devices, interfaces only"),
+            ("all", "Racks, devices, cables"),
+            ("inventory", "Racks and devices only"),
             ("cables", "Cables only"),
         ),
         default="all",
@@ -224,10 +215,8 @@ class PatchManagerImport(Job):
             if kwargs["import_mode"] in ("all", "inventory"):
                 racks = client.get_collection("cabinets", kwargs["rack_format"], self.page_size)
                 devices = client.get_collection("equipment", kwargs["device_format"], self.page_size)
-                ports = client.get_collection("ports", kwargs["port_format"], self.page_size)
                 self.import_racks(racks)
                 self.import_devices(devices)
-                self.import_interfaces(ports)
 
             if kwargs["import_mode"] in ("all", "cables"):
                 cables = client.get_collection("cables", kwargs["cable_format"], self.page_size)
@@ -282,22 +271,6 @@ class PatchManagerImport(Job):
                 },
             )
             self.logger.info("%s device %s", "Created" if created else "Updated", device)
-
-    def import_interfaces(self, rows: Iterable[Dict[str, Any]]) -> None:
-        for row in rows:
-            port_name = self.clean(row.get(self.fields["port_name"]))
-            parent = self.clean(row.get(self.fields["port_parent_device"]))
-            qname = self.clean(row.get(self.fields["port_qname"]))
-            device = self.find_device(parent) or self.find_device_from_qname(qname)
-            if not device or not port_name:
-                self.logger.warning("Skipping port; cannot resolve device or port name: %s", row)
-                continue
-            interface, created = Interface.objects.update_or_create(
-                device=device,
-                name=port_name,
-                defaults={"type": PORT_TYPE_DEFAULT, "description": self.clean(row.get(self.fields["port_template"]))},
-            )
-            self.logger.info("%s interface %s on %s", "Created" if created else "Updated", interface.name, device.name)
 
     def import_cables(self, rows: Iterable[Dict[str, Any]]) -> None:
         status = self.get_status()
@@ -361,14 +334,6 @@ class PatchManagerImport(Job):
         if len(parts) < 2:
             return None
         return PMEndpoint(raw=raw, device_name=parts[-2], port_name=parts[-1])
-
-    def find_device_from_qname(self, qname: str) -> Optional[Device]:
-        if not qname:
-            return None
-        parts = [PM_TEMPLATE_BRACKET_RE.sub("", p).strip() for p in qname.split(",") if p.strip()]
-        if len(parts) < 2:
-            return None
-        return self.find_device(parts[-2])
 
     def find_device(self, value: str) -> Optional[Device]:
         if not value:
