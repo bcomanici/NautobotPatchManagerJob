@@ -174,6 +174,7 @@ class PatchManagerImport(Job):
         self.dryrun = kwargs["dryrun"]
         self.page_size = kwargs["page_size"]
         self.fields = DEFAULT_FIELDS.copy()
+        self.no_valid_u_rows: List[Dict[str, str]] = []
 
         with transaction.atomic():
             if kwargs["import_mode"] in ("all", "inventory", "racks"):
@@ -187,9 +188,40 @@ class PatchManagerImport(Job):
             if kwargs["import_mode"] in ("all", "cables"):
                 self.import_cables(client.get_collection("cables", kwargs["cable_format"], self.page_size))
 
+            self.log_no_valid_u_summary()
+
             if self.dryrun:
                 self.logger.warning("Dry run enabled; rolling back all database changes.")
                 transaction.set_rollback(True)
+
+    def record_no_valid_u_row(self, name: str, row: Dict[str, Any]) -> None:
+        self.no_valid_u_rows.append(
+            {
+                "device": name,
+                "equipment_identifier": self.clean(row.get(self.fields["device_identifier"])),
+                "equipment_position": self.clean(row.get(self.fields["device_position"])),
+                "equipment_template": self.clean(row.get(self.fields["device_type"])),
+            }
+        )
+
+    def log_no_valid_u_summary(self) -> None:
+        if not self.no_valid_u_rows:
+            self.logger.info("No devices were skipped for missing or invalid U position.")
+            return
+
+        self.logger.warning(
+            "Devices skipped because Equipment Position did not contain a valid U position: %s",
+            len(self.no_valid_u_rows),
+        )
+
+        for item in self.no_valid_u_rows:
+            self.logger.warning(
+                "No valid U: device=%s position=%r template=%r identifier=%r",
+                item["device"],
+                item["equipment_position"],
+                item["equipment_template"],
+                item["equipment_identifier"],
+            )
 
     def import_racks(self, rows: Iterable[Dict[str, Any]]) -> None:
         status = self.get_status()
@@ -262,6 +294,7 @@ class PatchManagerImport(Job):
                     "Cataloging skipped device %s; no valid U position found in Equipment Position",
                     name,
                 )
+                self.record_no_valid_u_row(name, row)
                 skipped_port_detail_rows.append(row)
                 continue
 
@@ -519,6 +552,17 @@ class PatchManagerImport(Job):
                 candidate_devices.append(device)
 
         if not candidate_devices:
+            hostname_match = self.find_device_by_hostname_normalized_token(
+                identifier_parts=identifier_parts,
+                matched_racks=matched_racks,
+            )
+            if hostname_match:
+                self.logger.info(
+                    "Matched skipped port detail row using hostname-normalized fallback: %s",
+                    hostname_match.name,
+                )
+                return hostname_match
+
             return None
 
         matched_rack_ids = {rack.pk for rack in matched_racks}
@@ -531,6 +575,64 @@ class PatchManagerImport(Job):
 
         candidate_devices.sort(key=lambda device: len(device.name), reverse=True)
         return candidate_devices[0]
+
+    def find_device_by_hostname_normalized_token(
+        self,
+        identifier_parts: List[str],
+        matched_racks: List[Rack],
+    ) -> Optional[Device]:
+        """
+        Conservative hostname-like fallback for remaining PM/Nautobot hostname
+        mismatches, such as pec-3000r7 where surrounding identifier text differs.
+        """
+        hostname_tokens = [
+            self.normalize_hostname_match_token(part)
+            for part in identifier_parts
+            if self.normalize_hostname_match_token(part)
+        ]
+
+        if not hostname_tokens:
+            return None
+
+        candidate_devices: List[Device] = []
+
+        for device in Device.objects.filter(position__isnull=False).exclude(name=""):
+            device_hostname = self.normalize_hostname_match_token(device.name)
+            if not device_hostname:
+                continue
+
+            for token in hostname_tokens:
+                if token == device_hostname or token in device_hostname or device_hostname in token:
+                    candidate_devices.append(device)
+                    break
+
+        if not candidate_devices:
+            return None
+
+        matched_rack_ids = {rack.pk for rack in matched_racks}
+        if matched_rack_ids:
+            rack_scoped_candidates = [
+                device for device in candidate_devices if device.rack_id in matched_rack_ids
+            ]
+            if rack_scoped_candidates:
+                candidate_devices = rack_scoped_candidates
+
+        candidate_devices.sort(key=lambda device: len(device.name), reverse=True)
+        return candidate_devices[0]
+
+    @staticmethod
+    def normalize_hostname_match_token(value: str) -> str:
+        normalized = (value or "").replace("<COMMA>", ",").strip().lower()
+
+        match = re.search(r"\b[a-z]{2,10}[a-z0-9]*-[a-z0-9][a-z0-9-]*\b", normalized)
+        if not match:
+            return ""
+
+        token = re.sub(r"[^a-z0-9-]+", "", match.group(0))
+        if len(token) < 6:
+            return ""
+
+        return token
 
     def find_racks_in_identifier(self, identifier_parts: List[str]) -> List[Rack]:
         if not identifier_parts:
