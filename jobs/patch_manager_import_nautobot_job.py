@@ -599,12 +599,16 @@ class PatchManagerImport(Job):
                 continue
 
             if not rack:
+                equipment_identifier = self.clean(row.get(self.fields["device_identifier"]))
+                identifier_debug_parts = identifier_data.get("identifier_parts", [])
                 self.logger.warning(
                     "Device %s has a valid U position but no matching rack; importing without rack position. "
-                    "Equipment Position=%r Equipment Identifier=%r",
+                    "Equipment Position=%r Equipment Identifier=%r Parsed Identifier Parts=%r Rack Lookup Attempts=%s",
                     name,
                     self.clean(row.get(self.fields["device_position"])),
-                    self.clean(row.get(self.fields["device_identifier"])),
+                    equipment_identifier,
+                    identifier_debug_parts,
+                    self.describe_rack_lookup_attempts(identifier_debug_parts),
                 )
                 position = None
                 face = ""
@@ -2232,6 +2236,29 @@ class PatchManagerImport(Job):
                 return rack
 
         return self.get_or_create_virtual_rack_from_identifier_parts(rack_names, location)
+
+    def describe_rack_lookup_attempts(self, identifier_parts: List[str]) -> str:
+        descriptions: List[str] = []
+
+        for part in identifier_parts:
+            clean_part = self.clean(part)
+            if not clean_part:
+                continue
+
+            should_attempt = self.should_attempt_rack_lookup(clean_part)
+            candidates = self.get_rack_lookup_candidates(clean_part) if should_attempt else []
+            matches = []
+
+            if should_attempt:
+                for rack in self.find_rack_candidates(clean_part):
+                    matches.append(rack.name)
+
+            descriptions.append(
+                f"part={clean_part!r}; should_attempt={should_attempt}; "
+                f"candidates={candidates!r}; matches={matches!r}"
+            )
+
+        return " | ".join(descriptions)
 
     def find_rack_with_context(
         self,
