@@ -375,17 +375,16 @@ class PatchManagerImport(Job):
 
             device_type = self.get_or_create_device_type(self.clean(row.get(self.fields["device_type"])))
             role = self.get_or_create_device_role(identifier_data["role"])
-            rack = self.find_rack_from_names(identifier_data["racks"])
+            location = self.get_or_create_location(
+                identifier_data["location"] or "Patch Manager",
+                identifier_data["address"],
+            )
+            rack = self.find_rack_from_names(identifier_data["identifier_parts"], location)
 
             if rack:
                 location = rack.location
                 if location and location.location_type:
                     self.ensure_location_type_content_types(location.location_type)
-            else:
-                location = self.get_or_create_location(
-                    identifier_data["location"] or "Patch Manager",
-                    identifier_data["address"],
-                )
 
             position, face = self.parse_equipment_position(self.clean(row.get(self.fields["device_position"])))
 
@@ -940,6 +939,7 @@ class PatchManagerImport(Job):
             "location": parts[1] if len(parts) > 1 else "Patch Manager",
             "address": parts[2] if len(parts) > 2 else "",
             "racks": parts[3:] if len(parts) > 3 else [],
+            "identifier_parts": parts,
         }
 
     @staticmethod
@@ -1128,13 +1128,91 @@ class PatchManagerImport(Job):
 
         return unique_candidates
 
-    def find_rack_from_names(self, rack_names: List[str]) -> Optional[Rack]:
+    def find_rack_from_names(
+        self,
+        rack_names: List[str],
+        location: Optional[Location] = None,
+    ) -> Optional[Rack]:
         for rack_name in rack_names:
             rack = self.find_rack(rack_name)
             if rack:
                 return rack
 
-        return None
+        return self.get_or_create_virtual_rack_from_identifier_parts(rack_names, location)
+
+    def get_or_create_virtual_rack_from_identifier_parts(
+        self,
+        identifier_parts: List[str],
+        location: Optional[Location] = None,
+    ) -> Optional[Rack]:
+        """
+        Create a virtual rack for Patch Manager infrastructure buckets that are
+        not real rack names in Nautobot, such as FDPs, cages, or third-party
+        panel groups.
+
+        Example:
+        ["Syracuse POP", "Syracuse", "401 North Broad Street", "Crown Castle FDP", "syr-ISP-540"]
+        -> Rack name: "Syracuse POP Crown Castle FDP"
+        """
+        if not identifier_parts:
+            return None
+
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+        if not parts:
+            return None
+
+        virtual_part = self.find_virtual_rack_part(parts)
+        if not virtual_part:
+            return None
+
+        site_name = parts[0]
+        virtual_rack_name = f"{site_name} {virtual_part}"
+
+        rack_location = location or self.get_or_create_location(site_name)
+        status = self.get_status()
+
+        rack, created = Rack.objects.update_or_create(
+            name=virtual_rack_name,
+            location=rack_location,
+            defaults={
+                "status": status,
+                "u_height": DEFAULT_RACK_HEIGHT,
+                "comments": "Virtual rack created by Patch Manager import for non-rack infrastructure grouping.",
+            },
+        )
+
+        self.logger.info(
+            "%s virtual rack %s for unresolved Patch Manager rack identifier",
+            "Created" if created else "Updated",
+            rack.name,
+        )
+
+        return rack
+
+    @staticmethod
+    def find_virtual_rack_part(parts: List[str]) -> str:
+        virtual_keywords = (
+            "fdp",
+            "cage",
+            "panel",
+            "panels",
+            "netflix",
+        )
+
+        ignored_exact = {
+            "",
+        }
+
+        # Prefer explicit infrastructure bucket tokens over locations and device names.
+        for part in parts[3:]:
+            normalized = part.strip().lower()
+            if normalized in ignored_exact:
+                continue
+
+            if any(keyword in normalized for keyword in virtual_keywords):
+                return part.strip()
+
+        return ""
 
     def get_or_create_location(self, qname: str, physical_address: str = "") -> Location:
         parts = [p.strip() for p in qname.split(",") if p.strip()]
