@@ -1,4 +1,3 @@
-# Patch Manager import job version marker: notes-module-numeric-fix-v2
 """
 Nautobot Job: Import racks, devices, cables, and connection data from Patch Manager.
 """
@@ -1811,15 +1810,8 @@ class PatchManagerImport(Job):
     def replace_pm_port_details_note(self, device: Device, detail_rows: List[Dict[str, str]]) -> None:
         """
         Create/update a single Patch Manager sync Note assigned to this device.
-
-        Nautobot Notes are extras.note objects assigned to dcim.device. The API
-        shape matches:
-        - assigned_object_type = "dcim.device"
-        - assigned_object_id = device.pk
-        - note = markdown body
         """
         note_body = self.render_pm_port_details_note_body(detail_rows)
-
         content_type = ContentType.objects.get_for_model(Device)
 
         existing_note = (
@@ -1860,12 +1852,15 @@ class PatchManagerImport(Job):
             Device.objects.filter(pk=device.pk).update(comments=updated_comments)
 
     def render_pm_port_details_note_body(self, detail_rows: List[Dict[str, str]]) -> str:
+        rendered_block = self.render_pm_port_details_block(detail_rows)
+        rendered_block = rendered_block.replace(PM_PORT_DETAILS_START, "").replace(PM_PORT_DETAILS_END, "").strip()
+
         return "\n".join(
             [
                 PM_PORT_DETAILS_START,
                 f"# {PM_PORT_DETAILS_NOTE_TITLE}",
                 "",
-                self.render_pm_port_details_block(detail_rows).replace(PM_PORT_DETAILS_START, "").replace(PM_PORT_DETAILS_END, "").strip(),
+                rendered_block,
                 "",
                 PM_PORT_DETAILS_END,
             ]
