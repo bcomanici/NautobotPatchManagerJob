@@ -802,7 +802,11 @@ class PatchManagerImport(Job):
 
         identifier_parts = self.split_equipment_identifier_for_matching(identifier)
         matched_racks = self.find_racks_in_identifier(identifier_parts)
+
         parsed = self.parse_child_interface_identifier(identifier_parts)
+
+        if not parsed:
+            parsed = self.parse_optic_template_interface_row(row, identifier_parts)
 
         if not parsed:
             return None
@@ -813,6 +817,18 @@ class PatchManagerImport(Job):
         )
 
         if not parent_device:
+            parent_device = self.find_parent_device_by_right_to_left_scan(
+                identifier_parts=identifier_parts,
+                matched_racks=matched_racks,
+            )
+
+        if not parent_device:
+            self.logger.info(
+                "Interface row detected but no mounted parent device was found. "
+                "interface=%r identifier=%r",
+                parsed.get("interface_name"),
+                identifier,
+            )
             return None
 
         interface_name = parsed["interface_name"]
@@ -828,17 +844,17 @@ class PatchManagerImport(Job):
             },
         )
 
-        update_fields = []
+        update_needed = False
 
         if not interface.status_id:
             interface.status = status
-            update_fields.append("status")
+            update_needed = True
 
         if not getattr(interface, "type", None):
             interface.type = PORT_TYPE_DEFAULT
-            update_fields.append("type")
+            update_needed = True
 
-        if update_fields:
+        if update_needed:
             interface.validated_save()
 
         self.logger.info(
@@ -885,6 +901,117 @@ class PatchManagerImport(Job):
                 "parent_device": parent_token,
                 "interface_name": self.normalize_interface_name(interface_token),
             }
+
+        return None
+
+    def parse_optic_template_interface_row(
+        self,
+        row: Dict[str, Any],
+        identifier_parts: List[str],
+    ) -> Optional[Dict[str, str]]:
+        """
+        Detect optics/transceiver-style equipment rows where the interface name
+        is best taken from Equipment Label instead of the final identifier token.
+
+        Examples:
+            Equipment Template = QSFP-100G-LR4
+            Equipment Label = xe-0/0/13
+            Equipment Identifier = ..., pts-5110, 13, xe-0/0/13
+
+        Also supports simpler numeric/letter labels seen in PM exports when the
+        template clearly says the row is an optic/transceiver.
+        """
+        equipment_template = self.clean(row.get(self.fields["device_type"]))
+        equipment_label = self.clean(row.get(self.fields["device_name"]))
+
+        if not self.is_optic_or_transceiver_template(equipment_template):
+            return None
+
+        if not equipment_label:
+            return None
+
+        interface_name = self.normalize_interface_name(equipment_label)
+
+        parent_device = ""
+
+        # First try the normal parent position for ..., parent, slot, interface.
+        if len(identifier_parts) >= 3:
+            parent_device = identifier_parts[-3]
+
+        # If that does not look like a real parent token, leave it blank. The
+        # right-to-left scan in get_or_create_interface_for_child_row will find it.
+        if parent_device and self.looks_like_non_parent_identifier_token(parent_device):
+            parent_device = ""
+
+        return {
+            "parent_device": parent_device,
+            "interface_name": interface_name,
+        }
+
+    @staticmethod
+    def is_optic_or_transceiver_template(value: str) -> bool:
+        normalized = re.sub(r"\s+", " ", (value or "").strip().lower())
+
+        if not normalized:
+            return False
+
+        optic_keywords = (
+            "sfp",
+            "qsfp",
+            "cfp",
+            "xfp",
+            "optic",
+            "optical",
+            "transceiver",
+            "lr4",
+            "sr4",
+            "er4",
+            "zr",
+            "cwdm",
+            "dwdm",
+        )
+
+        return any(keyword in normalized for keyword in optic_keywords)
+
+    @staticmethod
+    def looks_like_non_parent_identifier_token(value: str) -> bool:
+        token = re.sub(r"\s+", " ", (value or "").strip().lower())
+
+        if not token:
+            return True
+
+        if re.match(r"^\d+$", token):
+            return True
+
+        if re.match(r"^(lc|mic|mpa|pic|slot|module)\s*-?\s*\d+$", token):
+            return True
+
+        if "/" in token:
+            return True
+
+        return False
+
+    def find_parent_device_by_right_to_left_scan(
+        self,
+        identifier_parts: List[str],
+        matched_racks: List[Rack],
+    ) -> Optional[Device]:
+        """
+        Scan identifier tokens from right to left and return the first mounted
+        Nautobot device token. This is safer than fuzzy matching because it only
+        accepts exact normalized device-name matches.
+        """
+        for token in reversed(identifier_parts):
+            if self.looks_like_non_parent_identifier_token(token):
+                continue
+
+            device = self.find_mounted_device_by_identifier_token(
+                token=token,
+                matched_racks=matched_racks,
+            )
+
+            if device:
+                return device
 
         return None
 
