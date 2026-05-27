@@ -59,6 +59,7 @@ DEFAULT_PASSIVE_MANUFACTURER_NAME = "Generic"
 DEFAULT_RACK_HEIGHT = 45
 MAX_NAUTOBOT_NAME_LENGTH = 255
 MAX_INTERFACE_NAME_LENGTH = 255
+MAX_INTERFACE_DESCRIPTION_LENGTH = 255
 
 RACK_LOOKUP_KEYWORDS = (
     "rack",
@@ -768,14 +769,28 @@ class PatchManagerImport(Job):
 
         for interface_id, detail_rows in details_by_interface_id.items():
             interface = Interface.objects.select_related("device").get(pk=interface_id)
-            updated_description = self.replace_pm_port_details_block(
-                getattr(interface, "description", "") or "",
-                detail_rows,
-            )
 
-            # Interface details are stored on the interface itself. Direct
-            # update avoids revalidating unrelated device rack placement.
-            Interface.objects.filter(pk=interface.pk).update(description=updated_description)
+            # Interface.description is varchar(255) in Nautobot, so keep only a
+            # compact summary there. Mirror the full PM detail block into the
+            # parent device comments under the interface name.
+            updated_description = self.build_interface_description_summary(detail_rows)
+
+            try:
+                Interface.objects.filter(pk=interface.pk).update(description=updated_description)
+            except DataError as exc:
+                self.logger.warning(
+                    "Interface description was too long even after summarizing for %s:%s: %s",
+                    interface.device.name,
+                    interface.name,
+                    exc,
+                )
+                Interface.objects.filter(pk=interface.pk).update(
+                    description=updated_description[:MAX_INTERFACE_DESCRIPTION_LENGTH]
+                )
+
+            details_by_device_id.setdefault(interface.device_id, []).extend(
+                self.wrap_interface_detail_rows(interface.name, detail_rows)
+            )
 
             self.logger.info(
                 "Updated Patch Manager port details on interface %s:%s",
@@ -1638,6 +1653,41 @@ class PatchManagerImport(Job):
 
         return normalized
 
+    def build_interface_description_summary(self, detail_rows: List[Dict[str, str]]) -> str:
+        """
+        Build a compact <=255 character description for Interface.description.
+        Full details are mirrored into the parent device comments.
+        """
+        values: List[str] = []
+
+        for detail_row in detail_rows:
+            for field_name in PORT_DETAIL_FIELDS:
+                value = self.clean(detail_row.get(field_name))
+                if value and value not in values:
+                    values.append(value)
+
+        summary = "PM interface details imported" if not values else "PM: " + " | ".join(values)
+        summary = re.sub(r"\s+", " ", summary).strip()
+
+        if len(summary) <= MAX_INTERFACE_DESCRIPTION_LENGTH:
+            return summary
+
+        return summary[: MAX_INTERFACE_DESCRIPTION_LENGTH - 3].rstrip() + "..."
+
+    def wrap_interface_detail_rows(
+        self,
+        interface_name: str,
+        detail_rows: List[Dict[str, str]],
+    ) -> List[Dict[str, str]]:
+        wrapped_rows: List[Dict[str, str]] = []
+
+        for detail_row in detail_rows:
+            wrapped = {"Interface": interface_name}
+            wrapped.update(detail_row)
+            wrapped_rows.append(wrapped)
+
+        return wrapped_rows
+
     def extract_port_detail_fields(self, row: Dict[str, Any]) -> Dict[str, str]:
         details: Dict[str, str] = {}
 
@@ -1675,7 +1725,9 @@ class PatchManagerImport(Job):
         lines = [PM_PORT_DETAILS_START]
 
         for index, details in enumerate(detail_rows, start=1):
-            if len(detail_rows) > 1:
+            if details.get("Interface"):
+                lines.append(f"### Interface {details['Interface']} - Entry {index}")
+            elif len(detail_rows) > 1:
                 lines.append(f"### Entry {index}")
 
             for header in PORT_DETAIL_FIELDS:
