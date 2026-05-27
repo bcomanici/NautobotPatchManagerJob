@@ -519,6 +519,7 @@ class PatchManagerImport(Job):
                 candidate_devices.append(device)
 
         if not candidate_devices:
+            self.log_near_miss_device_candidates(identifier_parts, matched_racks)
             return None
 
         matched_rack_ids = {rack.pk for rack in matched_racks}
@@ -531,6 +532,82 @@ class PatchManagerImport(Job):
 
         candidate_devices.sort(key=lambda device: len(device.name), reverse=True)
         return candidate_devices[0]
+
+    def log_near_miss_device_candidates(
+        self,
+        identifier_parts: List[str],
+        matched_racks: List[Rack],
+    ) -> None:
+        """
+        Log mounted device candidates when exact-token matching fails but a
+        token appears to be close to an imported mounted device name.
+
+        This is diagnostic-only and does not change matching behavior.
+        """
+        normalized_parts = [
+            self.normalize_pm_match_text(part)
+            for part in identifier_parts
+            if self.normalize_pm_match_text(part)
+        ]
+
+        if not normalized_parts:
+            return
+
+        devices_qs = Device.objects.filter(position__isnull=False).exclude(name="")
+        matched_rack_ids = {rack.pk for rack in matched_racks}
+
+        near_misses: List[Tuple[str, List[str]]] = []
+
+        for normalized_part in normalized_parts:
+            if len(normalized_part) < 4:
+                continue
+
+            candidates: List[str] = []
+
+            for device in devices_qs:
+                normalized_device_name = self.normalize_pm_match_text(device.name)
+                if not normalized_device_name:
+                    continue
+
+                is_near_match = (
+                    normalized_part in normalized_device_name
+                    or normalized_device_name in normalized_part
+                    or self.normalized_token_overlap(normalized_part, normalized_device_name)
+                )
+
+                if not is_near_match:
+                    continue
+
+                rack_note = ""
+                if device.rack:
+                    rack_note = f" rack={device.rack.name}"
+                    if matched_rack_ids and device.rack_id in matched_rack_ids:
+                        rack_note += " matched-rack"
+
+                candidates.append(f"{device.name}{rack_note}")
+
+            if candidates:
+                near_misses.append((normalized_part, candidates[:10]))
+
+        for token, candidates in near_misses[:10]:
+            self.logger.info(
+                "Port detail near-miss candidates for identifier token %r: %s",
+                token,
+                "; ".join(candidates),
+            )
+
+    @staticmethod
+    def normalized_token_overlap(left: str, right: str) -> bool:
+        """
+        Return True when two normalized strings share a meaningful token.
+
+        This is intentionally conservative for diagnostics. It avoids very
+        short tokens so generic values like 'lc1' or 'rack' do not create noisy
+        candidate logs.
+        """
+        left_tokens = {token for token in re.split(r"[^a-z0-9]+", left) if len(token) >= 5}
+        right_tokens = {token for token in re.split(r"[^a-z0-9]+", right) if len(token) >= 5}
+        return bool(left_tokens & right_tokens)
 
     def find_racks_in_identifier(self, identifier_parts: List[str]) -> List[Rack]:
         if not identifier_parts:
