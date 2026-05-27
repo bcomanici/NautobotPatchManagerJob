@@ -56,7 +56,7 @@ DEFAULT_STATUS_NAME = "Active"
 DEFAULT_DEVICE_ROLE_NAME = "Patch Manager Imported"
 DEFAULT_PASSIVE_ROLE_NAME = "Patch Manager Passive Infrastructure"
 DEFAULT_PASSIVE_MANUFACTURER_NAME = "Generic"
-DEFAULT_RACK_HEIGHT = 42
+DEFAULT_RACK_HEIGHT = 45
 
 RACK_LOOKUP_KEYWORDS = (
     "rack",
@@ -307,13 +307,15 @@ class PatchManagerImport(Job):
         Build a stable, location-qualified Nautobot rack name from the full
         Patch Manager Cabinet Identifier path.
 
-        Rules:
-        - Non-generic cabinet names are preserved, except <COMMA> is unescaped.
-        - Generic/template cabinet names like "Rack" or "Rack 45Ux19x40..." use
-          the Cabinet Identifier for uniqueness.
-        - If the identifier has a precise rack token, use that.
-        - Otherwise use the full location path plus the rack/template name so
-          repeated generic rows do not collapse into the same Nautobot rack.
+        Examples:
+        - NYSERNet Backbone,Ashburn VA - PoP,...,Cabinet 0316
+          -> Ashburn VA - PoP Cabinet 0316
+        - NYSERNet Backbone,Binghamton - PoP,...,Cabinet 001
+          -> Binghamton - PoP Cabinet 001
+        - NYSERNet Backbone,New York City - PoP,...,177828-COLO-CCF
+          -> New York City - PoP 177828-COLO-CCF
+        - Syracuse POP,Syracuse,...,Rack 101.02
+          -> Syracuse POP Rack 101.2
         """
         clean_name = self.clean(name).replace("<COMMA>", ",")
         clean_identifier = self.clean(identifier)
@@ -325,7 +327,9 @@ class PatchManagerImport(Job):
         if not parts:
             return clean_name
 
-        if not self.is_generic_patch_manager_rack_name(clean_name):
+        should_qualify = self.is_generic_patch_manager_rack_name(clean_name) or self.is_location_qualified_rack_id(clean_name)
+
+        if not should_qualify:
             return clean_name
 
         site_name = self.get_rack_name_prefix_from_identifier(parts)
@@ -334,6 +338,9 @@ class PatchManagerImport(Job):
         precise_part = self.find_precise_rack_identifier_part(hierarchy_parts)
         if precise_part:
             normalized_part = self.normalize_imported_rack_name_part(precise_part)
+
+            if self.is_location_qualified_rack_id(normalized_part):
+                return f"{site_name} {normalized_part}".strip()
 
             if re.match(r"^\d+\.\d+\b", normalized_part):
                 return normalized_part
@@ -357,14 +364,10 @@ class PatchManagerImport(Job):
     @staticmethod
     def get_rack_name_prefix_from_identifier(parts: List[str]) -> str:
         """
-        Choose the best prefix for generic Patch Manager rack names.
+        Choose the best prefix for generic/cabinet Patch Manager rack names.
 
-        Usually parts[0] is best, e.g. "Syracuse POP" should remain
-        "Syracuse POP Rack 101.2".
-
-        But some parts[0] values are broad organizational buckets, e.g.
-        "NYSERNet Backbone"; for those, parts[1] is the useful site name,
-        e.g. "Batavia Rack 301.10".
+        Keep POP-style names like "Syracuse POP", but when parts[0] is a broad
+        bucket like "NYSERNet Backbone", use parts[1] as the physical site.
         """
         if not parts:
             return ""
@@ -396,13 +399,25 @@ class PatchManagerImport(Job):
         normalized = re.sub(r"\s+", " ", name or "").strip().lower()
         return not normalized or normalized == "rack" or normalized.startswith("rack ")
 
+    @staticmethod
+    def is_location_qualified_rack_id(value: str) -> bool:
+        normalized = re.sub(r"\s+", " ", value or "").strip().lower()
+
+        if re.match(r"^cabinet\s+[a-z0-9-]+$", normalized):
+            return True
+
+        if re.match(r"^\d{5,}-colo-[a-z0-9-]+$", normalized):
+            return True
+
+        return False
+
     def find_precise_rack_identifier_part(self, parts: List[str]) -> str:
         ignored = set(IGNORED_RACK_LOOKUP_TOKENS) | {
             "nysernet cage",
             "nysenet cage",
         }
 
-        # Prefer explicit rack-number references such as Rack 101.02 Panel 2.
+        # Explicit rack-number references such as Rack 101.02 Panel 2.
         for part in reversed(parts):
             normalized = self.normalize_pm_match_text(part)
             if normalized in ignored:
@@ -411,8 +426,7 @@ class PatchManagerImport(Job):
             if re.search(r"\brack\s+\d+\.\d+\b", normalized):
                 return part
 
-        # Treat cabinet labels as authoritative rack identifiers:
-        # Cabinet 0316, Cabinet 001, etc.
+        # Cabinet 0316 / Cabinet 001 are authoritative rack identifiers.
         for part in reversed(parts):
             normalized = self.normalize_pm_match_text(part)
             if normalized in ignored:
@@ -421,8 +435,7 @@ class PatchManagerImport(Job):
             if re.search(r"\bcabinet\s+[a-z0-9-]+\b", normalized):
                 return part
 
-        # Treat COLO cabinet IDs as authoritative rack identifiers:
-        # 177828-COLO-CCF, 177829-COLO-CCF, etc.
+        # 177828-COLO-CCF-style cabinet IDs are authoritative rack identifiers.
         for part in reversed(parts):
             normalized = self.normalize_pm_match_text(part)
             if normalized in ignored:
@@ -431,8 +444,7 @@ class PatchManagerImport(Job):
             if re.search(r"\b\d{5,}-colo-[a-z0-9-]+\b", normalized):
                 return part
 
-        # Treat leading decimal rack identifiers as authoritative:
-        # 2405.14 NYPH, 2405.15 NYSERNet - 55a1, SAN. Netflix, etc.
+        # Leading decimal rack identifiers such as 2405.14 NYPH.
         for part in reversed(parts):
             normalized = self.normalize_pm_match_text(part)
             if normalized in ignored:
@@ -473,7 +485,7 @@ class PatchManagerImport(Job):
             if normalized_key == self.normalize_pm_match_text(site_name):
                 continue
 
-            if re.search(r"\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|broad)", normalized_key):
+            if re.search(r"\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|broad|court|ct)", normalized_key):
                 continue
 
             if normalized_part not in cleaned_parts:
@@ -1580,9 +1592,7 @@ class PatchManagerImport(Job):
     def get_rack_lookup_candidates(self, value: str) -> List[str]:
         """
         Return possible Nautobot rack names from a Patch Manager rack identifier.
-
-        Important: '<COMMA>' is an escaped comma inside a single Patch Manager
-        field, so preserve it during splitting and then unescape it for matching.
+        '<COMMA>' is an escaped comma inside a single Patch Manager field.
         """
         raw = self.clean(value)
         unescaped = raw.replace("<COMMA>", ",")
@@ -1592,33 +1602,27 @@ class PatchManagerImport(Job):
             unescaped,
         ]
 
-        # Preserve the legacy behavior as a fallback for identifiers that really
-        # are comma-delimited and use the last segment as the rack name.
         last_segment = unescaped.split(",")[-1].strip()
         if last_segment:
             candidates.append(last_segment)
 
-        # Explicit Rack 101.02 -> Rack 101.2
         rack_match = re.search(r"\brack\s+(\d+)\.0*(\d+)\b", unescaped, re.IGNORECASE)
         if rack_match:
             candidates.append(f"Rack {rack_match.group(1)}.{int(rack_match.group(2))}")
 
-        # Cabinet 0316 / Cabinet 001 are authoritative rack identifiers.
         cabinet_match = re.search(r"\bcabinet\s+([a-z0-9-]+)\b", unescaped, re.IGNORECASE)
         if cabinet_match:
-            candidates.append(f"Cabinet {cabinet_match.group(1)}")
+            cabinet_name = f"Cabinet {cabinet_match.group(1)}"
+            candidates.append(cabinet_name)
 
-        # COLO cabinet IDs are authoritative rack identifiers.
         colo_match = re.search(r"\b(\d{5,}-COLO-[A-Za-z0-9-]+)\b", unescaped, re.IGNORECASE)
         if colo_match:
             candidates.append(colo_match.group(1))
 
-        # Leading decimal rack identifiers should remain whole-token candidates.
         decimal_match = re.search(r"^(\d+\.\d+\b.*)$", unescaped)
         if decimal_match:
             candidates.append(decimal_match.group(1).strip())
 
-        # Normalize decimal zero padding anywhere in candidates: 101.02 -> 101.2.
         expanded_candidates: List[str] = []
         for candidate in candidates:
             expanded_candidates.append(candidate)
@@ -1630,7 +1634,6 @@ class PatchManagerImport(Job):
                 )
             )
 
-        # Deduplicate while preserving order.
         unique_candidates: List[str] = []
         for candidate in expanded_candidates:
             candidate = re.sub(r"\s+", " ", candidate.strip())
