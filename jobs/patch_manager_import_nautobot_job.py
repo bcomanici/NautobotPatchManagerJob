@@ -820,11 +820,6 @@ class PatchManagerImport(Job):
         """
         Resolve module/subcomponent and generic numeric child rows to their
         parent mounted device so their PM details can go into a device Note.
-
-        Examples:
-        - ..., ash-9204, LC1
-        - ..., ash-9204, Power 0
-        - ..., Cisco NCS 540X-6Z18G-SYS-A, 18, 18
         """
         identifier = self.clean(row.get(self.fields["device_identifier"]))
         if not identifier:
