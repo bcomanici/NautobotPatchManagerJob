@@ -175,6 +175,7 @@ class PatchManagerImport(Job):
         self.page_size = kwargs["page_size"]
         self.fields = DEFAULT_FIELDS.copy()
         self.no_valid_u_rows: List[Dict[str, str]] = []
+        self.no_valid_u_outcomes: Dict[int, Dict[str, str]] = {}
 
         with transaction.atomic():
             if kwargs["import_mode"] in ("all", "inventory", "racks"):
@@ -197,6 +198,7 @@ class PatchManagerImport(Job):
     def record_no_valid_u_row(self, name: str, row: Dict[str, Any]) -> None:
         self.no_valid_u_rows.append(
             {
+                "row_id": str(id(row)),
                 "device": name,
                 "equipment_identifier": self.clean(row.get(self.fields["device_identifier"])),
                 "equipment_position": self.clean(row.get(self.fields["device_position"])),
@@ -204,24 +206,76 @@ class PatchManagerImport(Job):
             }
         )
 
+    def mark_no_valid_u_outcome(
+        self,
+        row: Dict[str, Any],
+        outcome: str,
+        target_device: Optional[Device] = None,
+    ) -> None:
+        self.no_valid_u_outcomes[id(row)] = {
+            "outcome": outcome,
+            "target_device": target_device.name if target_device else "",
+        }
+
     def log_no_valid_u_summary(self) -> None:
         if not self.no_valid_u_rows:
             self.logger.info("No devices were skipped for missing or invalid U position.")
             return
 
-        self.logger.warning(
-            "Devices skipped because Equipment Position did not contain a valid U position: %s",
-            len(self.no_valid_u_rows),
-        )
+        grouped: Dict[str, List[Dict[str, str]]] = {
+            "attached_with_port_details": [],
+            "matched_parent_but_empty_details": [],
+            "no_matching_parent": [],
+            "not_processed": [],
+        }
 
         for item in self.no_valid_u_rows:
-            self.logger.warning(
-                "No valid U: device=%s position=%r template=%r identifier=%r",
-                item["device"],
-                item["equipment_position"],
-                item["equipment_template"],
-                item["equipment_identifier"],
-            )
+            row_id = int(item["row_id"])
+            outcome_data = self.no_valid_u_outcomes.get(row_id, {})
+            outcome = outcome_data.get("outcome", "not_processed")
+            target_device = outcome_data.get("target_device", "")
+
+            item_with_target = dict(item)
+            item_with_target["target_device"] = target_device
+
+            if outcome in grouped:
+                grouped[outcome].append(item_with_target)
+            else:
+                grouped["not_processed"].append(item_with_target)
+
+        self.logger.warning(
+            "No-valid-U summary: total=%s attached_with_port_details=%s "
+            "matched_parent_but_empty_details=%s no_matching_parent=%s not_processed=%s",
+            len(self.no_valid_u_rows),
+            len(grouped["attached_with_port_details"]),
+            len(grouped["matched_parent_but_empty_details"]),
+            len(grouped["no_matching_parent"]),
+            len(grouped["not_processed"]),
+        )
+
+        summary_labels = {
+            "attached_with_port_details": "No valid U, attached to parent and appended port details",
+            "matched_parent_but_empty_details": "No valid U, matched parent but no port detail fields populated",
+            "no_matching_parent": "No valid U, no matching parent device found",
+            "not_processed": "No valid U, not processed by port-detail pass",
+        }
+
+        for outcome, rows in grouped.items():
+            if not rows:
+                continue
+
+            self.logger.warning("%s: %s", summary_labels[outcome], len(rows))
+
+            for item in rows:
+                self.logger.warning(
+                    "%s: device=%s target=%s position=%r template=%r identifier=%r",
+                    summary_labels[outcome],
+                    item["device"],
+                    item.get("target_device", ""),
+                    item["equipment_position"],
+                    item["equipment_template"],
+                    item["equipment_identifier"],
+                )
 
     def build_rack_name(self, name: str, identifier: str) -> str:
         """
@@ -479,6 +533,7 @@ class PatchManagerImport(Job):
             )
 
             if not target_device:
+                self.mark_no_valid_u_outcome(row, "no_matching_parent")
                 self.logger.info(
                     "Skipping port detail row; could not find imported parent device from Equipment Identifier: %s",
                     row.get(self.fields["device_identifier"]),
@@ -487,11 +542,14 @@ class PatchManagerImport(Job):
 
             details = self.extract_port_detail_fields(row)
             if not details:
+                self.mark_no_valid_u_outcome(row, "matched_parent_but_empty_details", target_device)
                 self.logger.info(
                     "Skipping port detail row for %s; no port detail fields populated",
                     target_device.name,
                 )
                 continue
+
+            self.mark_no_valid_u_outcome(row, "attached_with_port_details", target_device)
 
             details_by_device_id.setdefault(target_device.pk, []).append(details)
 
@@ -995,7 +1053,50 @@ class PatchManagerImport(Job):
                 if rack_variants & candidate_variants:
                     return rack
 
+        # Conservative fallback: if the PM token and Nautobot rack share the
+        # same rack-number-like value, allow a contains match. This handles
+        # values like "Rack 101.02 Panel 2" or escaped-comma rack descriptors.
+        for rack in Rack.objects.all():
+            normalized_rack_name = self.normalize_pm_match_text(rack.name)
+            rack_numbers = self.extract_rack_number_tokens(normalized_rack_name)
+
+            if not rack_numbers:
+                continue
+
+            for normalized_candidate in normalized_candidates:
+                candidate_numbers = self.extract_rack_number_tokens(normalized_candidate)
+                if not candidate_numbers or not (rack_numbers & candidate_numbers):
+                    continue
+
+                if (
+                    normalized_candidate in normalized_rack_name
+                    or normalized_rack_name in normalized_candidate
+                    or self.rack_context_overlaps(normalized_candidate, normalized_rack_name)
+                ):
+                    return rack
+
+        self.logger.info(
+            "Rack lookup failed for value=%r candidates=%s",
+            value,
+            candidates,
+        )
         return None
+
+    @staticmethod
+    def extract_rack_number_tokens(value: str) -> set:
+        tokens = set()
+
+        for match in re.finditer(r"\b(\d+)\.0*(\d+)\b", value or ""):
+            tokens.add(f"{match.group(1)}.{int(match.group(2))}")
+
+        return tokens
+
+    @staticmethod
+    def rack_context_overlaps(left: str, right: str) -> bool:
+        left_tokens = {token for token in re.split(r"[^a-z0-9]+", left) if len(token) >= 3}
+        right_tokens = {token for token in re.split(r"[^a-z0-9]+", right) if len(token) >= 3}
+        ignored = {"rack", "panel", "floor", "colo", "cage", "pop", "the"}
+        return bool((left_tokens - ignored) & (right_tokens - ignored))
 
     def get_rack_lookup_candidates(self, value: str) -> List[str]:
         """
