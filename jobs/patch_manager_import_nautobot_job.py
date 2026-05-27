@@ -1157,6 +1157,7 @@ class PatchManagerImport(Job):
 
         return None
 
+    @staticmethod
     def extract_rack_number_tokens(value: str) -> set:
         tokens = set()
 
@@ -1193,10 +1194,16 @@ class PatchManagerImport(Job):
         if last_segment:
             candidates.append(last_segment)
 
+        # Strip panel suffixes from real rack references.
+        rack_match = re.search(r"\brack\s+(\d+)\.0*(\d+)\b", unescaped, re.IGNORECASE)
+        if rack_match:
+            normalized_rack = f"Rack {rack_match.group(1)}.{int(rack_match.group(2))}"
+            candidates.append(normalized_rack)
+
         # Deduplicate while preserving order.
         unique_candidates: List[str] = []
         for candidate in candidates:
-            candidate = candidate.strip()
+            candidate = re.sub(r"\s+", " ", candidate.strip())
             if candidate and candidate not in unique_candidates:
                 unique_candidates.append(candidate)
 
@@ -1220,8 +1227,8 @@ class PatchManagerImport(Job):
         location: Optional[Location] = None,
     ) -> Optional[Rack]:
         """
-        Create a virtual rack for Patch Manager infrastructure buckets that are
-        not real rack names in Nautobot, such as FDPs, cages, or third-party
+        Create a virtual rack only for Patch Manager infrastructure buckets that
+        are not real rack names in Nautobot, such as FDPs, cages, or third-party
         panel groups.
 
         Example:
@@ -1240,7 +1247,11 @@ class PatchManagerImport(Job):
             return None
 
         site_name = parts[0]
-        virtual_rack_name = f"{site_name} {virtual_part}"
+        virtual_rack_name = re.sub(r"\s+", " ", f"{site_name} {virtual_part}").strip()
+
+        # Guard against creating vague or duplicate-looking racks.
+        if not virtual_rack_name or virtual_rack_name.lower().startswith("rack "):
+            return None
 
         rack_location = location or self.get_or_create_location(site_name)
         status = self.get_status()
@@ -1258,7 +1269,7 @@ class PatchManagerImport(Job):
         self.add_rack_to_lookup_cache(rack)
 
         self.logger.info(
-            "%s virtual rack %s for unresolved Patch Manager rack identifier",
+            "%s virtual rack %s for unresolved Patch Manager infrastructure bucket",
             "Created" if created else "Updated",
             rack.name,
         )
@@ -1267,14 +1278,31 @@ class PatchManagerImport(Job):
 
     @staticmethod
     def find_virtual_rack_part(parts: List[str]) -> str:
-        # Prefer explicit infrastructure bucket tokens over locations and device names.
+        """
+        Return only non-rack infrastructure buckets for virtual-rack creation.
+
+        Do not create virtual racks from strings that contain "rack"; those
+        should either resolve to an existing real rack or remain reported as
+        no-rack so we can correct the rack normalizer.
+        """
+        virtual_keywords = (
+            "fdp",
+            "cage",
+            "panel",
+            "panels",
+            "netflix",
+        )
+
         for part in parts[3:]:
             normalized = re.sub(r"\s+", " ", part.strip().lower())
 
             if not normalized or normalized in IGNORED_RACK_LOOKUP_TOKENS:
                 continue
 
-            if any(keyword in normalized for keyword in RACK_LOOKUP_KEYWORDS):
+            if "rack" in normalized:
+                continue
+
+            if any(keyword in normalized for keyword in virtual_keywords):
                 return part.strip()
 
         return ""
