@@ -15,7 +15,7 @@ from django.core.exceptions import ValidationError
 from django.db import DataError, IntegrityError, transaction
 from nautobot.apps.jobs import BooleanVar, ChoiceVar, IntegerVar, Job, StringVar
 from nautobot.dcim.models import Cable, Device, DeviceType, Interface, Location, LocationType, Manufacturer, Rack
-from nautobot.extras.models import Role, SecretsGroup, SecretsGroupAssociation, Status
+from nautobot.extras.models import Note, Role, SecretsGroup, SecretsGroupAssociation, Status
 
 
 DEFAULT_FORMATS = {
@@ -746,6 +746,9 @@ class PatchManagerImport(Job):
                 target_device = self.find_imported_device_in_identifier(identifier)
 
             if not target_device:
+                target_device = self.find_parent_device_for_module_or_numeric_row(row)
+
+            if not target_device:
                 target_device = self.get_or_create_passive_infrastructure_device_for_row(row)
 
             if not target_device:
@@ -805,14 +808,123 @@ class PatchManagerImport(Job):
 
         for device_id, detail_rows in details_by_device_id.items():
             device = Device.objects.get(pk=device_id)
-            updated_comments = self.replace_pm_port_details_block(device.comments or "", detail_rows)
+            self.replace_pm_port_details_note(device, detail_rows)
+            self.logger.info("Updated Patch Manager port details note on device %s", device.name)
 
-            # This pass only updates comments. Use a direct column update so an
-            # existing device with a rack-placement issue does not fail the
-            # whole sync when Nautobot revalidates rack occupancy.
-            Device.objects.filter(pk=device.pk).update(comments=updated_comments)
+    def find_parent_device_for_module_or_numeric_row(
+        self,
+        row: Dict[str, Any],
+    ) -> Optional[Device]:
+        """
+        Resolve module/subcomponent and generic numeric child rows to their
+        parent mounted device so their PM details can go into a device Note.
 
-            self.logger.info("Updated Patch Manager port details on device %s", device.name)
+        Examples:
+        - ..., ash-9204, LC1
+        - ..., ash-9204, Power 0
+        - ..., Cisco NCS 540X-6Z18G-SYS-A, 18, 18
+        """
+        identifier = self.clean(row.get(self.fields["device_identifier"]))
+        if not identifier:
+            return None
+
+        identifier_parts = self.split_equipment_identifier_for_matching(identifier)
+        if not identifier_parts:
+            return None
+
+        equipment_label = self.clean(row.get(self.fields["device_name"]))
+        equipment_template = self.clean(row.get(self.fields["device_type"]))
+
+        if not (
+            self.is_module_or_subcomponent_label(equipment_label)
+            or self.is_generic_numeric_or_directional_label(equipment_label)
+            or self.is_module_or_subcomponent_template(equipment_template)
+        ):
+            return None
+
+        matched_racks = self.find_racks_in_identifier(identifier_parts)
+
+        parent_device = self.find_parent_device_by_right_to_left_scan(
+            identifier_parts=identifier_parts,
+            matched_racks=matched_racks,
+        )
+
+        if parent_device:
+            self.logger.info(
+                "Matched module/numeric child row to parent device %s: label=%r identifier=%r",
+                parent_device.name,
+                equipment_label,
+                identifier,
+            )
+
+        return parent_device
+
+    @staticmethod
+    def is_module_or_subcomponent_label(value: str) -> bool:
+        token = re.sub(r"\s+", " ", (value or "").strip().lower())
+
+        if not token:
+            return False
+
+        patterns = (
+            r"^lc\d+$",
+            r"^scu$",
+            r"^ncu$",
+            r"^mic",
+            r"^mpa",
+            r"^pic",
+            r"^fan\s*\d*$",
+            r"^power\s*\d*$",
+            r"^psu\s*\d*$",
+            r"^pem\s*\d*$",
+            r"^slot\s*\d+$",
+            r"^module\s*\d+$",
+        )
+
+        return any(re.match(pattern, token) for pattern in patterns)
+
+    @staticmethod
+    def is_module_or_subcomponent_template(value: str) -> bool:
+        token = re.sub(r"\s+", " ", (value or "").strip().lower())
+
+        if not token:
+            return False
+
+        keywords = (
+            "line card",
+            "linecard",
+            "routing engine",
+            "supervisor",
+            "fan",
+            "power",
+            "psu",
+            "pem",
+            "mic",
+            "mpa",
+            "pic",
+            "scu",
+            "ncu",
+        )
+
+        return any(keyword in token for keyword in keywords)
+
+    @staticmethod
+    def is_generic_numeric_or_directional_label(value: str) -> bool:
+        token = re.sub(r"\s+", " ", (value or "").strip().lower())
+
+        if not token:
+            return False
+
+        if re.match(r"^\d+(,\d+)*$", token):
+            return True
+
+        if token in {"ne", "nw", "se", "sw", "tx", "rx"}:
+            return True
+
+        if re.match(r"^traffic\s*\d+$", token):
+            return True
+
+        return False
 
     def get_or_create_interface_for_child_row(
         self,
@@ -1692,6 +1804,69 @@ class PatchManagerImport(Job):
             wrapped_rows.append(wrapped)
 
         return wrapped_rows
+
+    def replace_pm_port_details_note(self, device: Device, detail_rows: List[Dict[str, str]]) -> None:
+        """
+        Create/update a single Patch Manager sync Note assigned to this device.
+
+        Nautobot Notes are extras.note objects assigned to dcim.device. The API
+        shape matches:
+        - assigned_object_type = "dcim.device"
+        - assigned_object_id = device.pk
+        - note = markdown body
+        """
+        note_body = self.render_pm_port_details_note_body(detail_rows)
+
+        content_type = ContentType.objects.get_for_model(Device)
+
+        existing_note = (
+            Note.objects.filter(
+                assigned_object_type=content_type,
+                assigned_object_id=device.pk,
+                note__contains=PM_PORT_DETAILS_START,
+            )
+            .order_by("-last_updated")
+            .first()
+        )
+
+        if existing_note:
+            existing_note.note = note_body
+            existing_note.validated_save()
+            return
+
+        create_kwargs = {
+            "assigned_object_type": content_type,
+            "assigned_object_id": device.pk,
+            "note": note_body,
+        }
+
+        user = getattr(self, "user", None)
+        if user:
+            create_kwargs["user"] = user
+
+        try:
+            note = Note(**create_kwargs)
+            note.validated_save()
+        except Exception as exc:
+            self.logger.warning(
+                "Could not create Patch Manager note for device %s: %s. Falling back to comments.",
+                device.name,
+                exc,
+            )
+            updated_comments = self.replace_pm_port_details_block(device.comments or "", detail_rows)
+            Device.objects.filter(pk=device.pk).update(comments=updated_comments)
+
+    def render_pm_port_details_note_body(self, detail_rows: List[Dict[str, str]]) -> str:
+        return "\n".join(
+            [
+                PM_PORT_DETAILS_START,
+                f"# {PM_PORT_DETAILS_NOTE_TITLE}",
+                "",
+                self.render_pm_port_details_block(detail_rows).replace(PM_PORT_DETAILS_START, "").replace(PM_PORT_DETAILS_END, "").strip(),
+                "",
+                PM_PORT_DETAILS_END,
+            ]
+        )
 
     def extract_port_detail_fields(self, row: Dict[str, Any]) -> Dict[str, str]:
         details: Dict[str, str] = {}
