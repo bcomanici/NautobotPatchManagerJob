@@ -398,6 +398,7 @@ class PatchManagerImport(Job):
             "nysenet cage",
         }
 
+        # Prefer explicit rack-number references such as Rack 101.02 Panel 2.
         for part in reversed(parts):
             normalized = self.normalize_pm_match_text(part)
             if normalized in ignored:
@@ -406,6 +407,28 @@ class PatchManagerImport(Job):
             if re.search(r"\brack\s+\d+\.\d+\b", normalized):
                 return part
 
+        # Treat cabinet labels as authoritative rack identifiers:
+        # Cabinet 0316, Cabinet 001, etc.
+        for part in reversed(parts):
+            normalized = self.normalize_pm_match_text(part)
+            if normalized in ignored:
+                continue
+
+            if re.search(r"\bcabinet\s+[a-z0-9-]+\b", normalized):
+                return part
+
+        # Treat COLO cabinet IDs as authoritative rack identifiers:
+        # 177828-COLO-CCF, 177829-COLO-CCF, etc.
+        for part in reversed(parts):
+            normalized = self.normalize_pm_match_text(part)
+            if normalized in ignored:
+                continue
+
+            if re.search(r"\b\d{5,}-colo-[a-z0-9-]+\b", normalized):
+                return part
+
+        # Treat leading decimal rack identifiers as authoritative:
+        # 2405.14 NYPH, 2405.15 NYSERNet - 55a1, SAN. Netflix, etc.
         for part in reversed(parts):
             normalized = self.normalize_pm_match_text(part)
             if normalized in ignored:
@@ -1313,7 +1336,7 @@ class PatchManagerImport(Job):
         Return possible Nautobot rack names from a Patch Manager rack identifier.
 
         Important: '<COMMA>' is an escaped comma inside a single Patch Manager
-        field, so convert it before comparing to Nautobot rack names.
+        field, so preserve it during splitting and then unescape it for matching.
         """
         raw = self.clean(value)
         unescaped = raw.replace("<COMMA>", ",")
@@ -1329,15 +1352,41 @@ class PatchManagerImport(Job):
         if last_segment:
             candidates.append(last_segment)
 
-        # Strip panel suffixes from real rack references.
+        # Explicit Rack 101.02 -> Rack 101.2
         rack_match = re.search(r"\brack\s+(\d+)\.0*(\d+)\b", unescaped, re.IGNORECASE)
         if rack_match:
-            normalized_rack = f"Rack {rack_match.group(1)}.{int(rack_match.group(2))}"
-            candidates.append(normalized_rack)
+            candidates.append(f"Rack {rack_match.group(1)}.{int(rack_match.group(2))}")
+
+        # Cabinet 0316 / Cabinet 001 are authoritative rack identifiers.
+        cabinet_match = re.search(r"\bcabinet\s+([a-z0-9-]+)\b", unescaped, re.IGNORECASE)
+        if cabinet_match:
+            candidates.append(f"Cabinet {cabinet_match.group(1)}")
+
+        # COLO cabinet IDs are authoritative rack identifiers.
+        colo_match = re.search(r"\b(\d{5,}-COLO-[A-Za-z0-9-]+)\b", unescaped, re.IGNORECASE)
+        if colo_match:
+            candidates.append(colo_match.group(1))
+
+        # Leading decimal rack identifiers should remain whole-token candidates.
+        decimal_match = re.search(r"^(\d+\.\d+\b.*)$", unescaped)
+        if decimal_match:
+            candidates.append(decimal_match.group(1).strip())
+
+        # Normalize decimal zero padding anywhere in candidates: 101.02 -> 101.2.
+        expanded_candidates: List[str] = []
+        for candidate in candidates:
+            expanded_candidates.append(candidate)
+            expanded_candidates.append(
+                re.sub(
+                    r"(\d+)\.0+(\d+)",
+                    lambda match: f"{match.group(1)}.{int(match.group(2))}",
+                    candidate,
+                )
+            )
 
         # Deduplicate while preserving order.
         unique_candidates: List[str] = []
-        for candidate in candidates:
+        for candidate in expanded_candidates:
             candidate = re.sub(r"\s+", " ", candidate.strip())
             if candidate and candidate not in unique_candidates:
                 unique_candidates.append(candidate)
