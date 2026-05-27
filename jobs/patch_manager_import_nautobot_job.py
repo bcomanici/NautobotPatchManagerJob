@@ -56,6 +56,26 @@ DEFAULT_STATUS_NAME = "Active"
 DEFAULT_DEVICE_ROLE_NAME = "Patch Manager Imported"
 DEFAULT_RACK_HEIGHT = 42
 
+RACK_LOOKUP_KEYWORDS = (
+    "rack",
+    "fdp",
+    "cage",
+    "panel",
+    "panels",
+    "netflix",
+)
+
+IGNORED_RACK_LOOKUP_TOKENS = {
+    "24th floor",
+    "401 north broad street",
+    "32 aoa",
+    "32 aoa colo",
+    "32 aoa col",
+    "syracuse",
+    "syracuse pop",
+    "patch manager",
+}
+
 PORT_DETAIL_FIELDS = (
     "Port Labeling Front",
     "Port Labeling Rear",
@@ -176,6 +196,8 @@ class PatchManagerImport(Job):
         self.fields = DEFAULT_FIELDS.copy()
         self.no_valid_u_rows: List[Dict[str, str]] = []
         self.no_valid_u_outcomes: Dict[int, Dict[str, str]] = {}
+        self.rack_lookup_cache: Dict[str, List[Rack]] = {}
+        self.rack_lookup_cache_loaded = False
 
         with transaction.atomic():
             if kwargs["import_mode"] in ("all", "inventory", "racks"):
@@ -353,6 +375,8 @@ class PatchManagerImport(Job):
                     "comments": self.clean(row.get(self.fields["rack_description"])),
                 },
             )
+
+            self.add_rack_to_lookup_cache(rack)
 
             self.logger.info(
                 "%s rack %s (%sU)",
@@ -1020,16 +1044,79 @@ class PatchManagerImport(Job):
         name = value.split(",")[-1].strip()
         return Device.objects.filter(name=name).first()
 
+    def load_rack_lookup_cache(self) -> None:
+        if self.rack_lookup_cache_loaded:
+            return
+
+        self.rack_lookup_cache = {}
+
+        for rack in Rack.objects.all().select_related("location"):
+            keys = {
+                self.normalize_pm_match_text(rack.name),
+                self.normalize_rack_name_order(self.normalize_pm_match_text(rack.name)),
+            }
+
+            for number_token in self.extract_rack_number_tokens(rack.name):
+                keys.add(number_token)
+
+            for key in keys:
+                if not key:
+                    continue
+                self.rack_lookup_cache.setdefault(key, []).append(rack)
+
+        self.rack_lookup_cache_loaded = True
+
+    def add_rack_to_lookup_cache(self, rack: Rack) -> None:
+        if not self.rack_lookup_cache_loaded:
+            return
+
+        keys = {
+            self.normalize_pm_match_text(rack.name),
+            self.normalize_rack_name_order(self.normalize_pm_match_text(rack.name)),
+        }
+
+        for number_token in self.extract_rack_number_tokens(rack.name):
+            keys.add(number_token)
+
+        for key in keys:
+            if not key:
+                continue
+            cached_racks = self.rack_lookup_cache.setdefault(key, [])
+            if rack not in cached_racks:
+                cached_racks.append(rack)
+
+    def should_attempt_rack_lookup(self, value: str) -> bool:
+        normalized = self.normalize_pm_match_text(value)
+
+        if not normalized or normalized in IGNORED_RACK_LOOKUP_TOKENS:
+            return False
+
+        if self.extract_rack_number_tokens(normalized):
+            return True
+
+        return any(keyword in normalized for keyword in RACK_LOOKUP_KEYWORDS)
+
     def find_rack(self, value: str) -> Optional[Rack]:
-        if not value:
+        if not value or not self.should_attempt_rack_lookup(value):
             return None
 
+        self.load_rack_lookup_cache()
         candidates = self.get_rack_lookup_candidates(value)
 
         for candidate in candidates:
-            rack = Rack.objects.filter(name=candidate).first()
-            if rack:
-                return rack
+            normalized_candidate = self.normalize_pm_match_text(candidate)
+            candidate_keys = {
+                normalized_candidate,
+                self.normalize_rack_name_order(normalized_candidate),
+            }
+
+            for number_token in self.extract_rack_number_tokens(normalized_candidate):
+                candidate_keys.add(number_token)
+
+            for key in candidate_keys:
+                cached_matches = self.rack_lookup_cache.get(key, [])
+                if cached_matches:
+                    return cached_matches[0]
 
         normalized_candidates = {
             self.normalize_pm_match_text(candidate)
@@ -1037,26 +1124,19 @@ class PatchManagerImport(Job):
             if self.normalize_pm_match_text(candidate)
         }
 
-        for rack in Rack.objects.all():
-            normalized_rack_name = self.normalize_pm_match_text(rack.name)
-            rack_variants = {
-                normalized_rack_name,
-                self.normalize_rack_name_order(normalized_rack_name),
-            }
+        # Conservative cached fallback: compare only against cached rack entries,
+        # but do not query Rack.objects.all() per token.
+        possible_racks: List[Rack] = []
+        seen_rack_ids = set()
 
-            for normalized_candidate in normalized_candidates:
-                candidate_variants = {
-                    normalized_candidate,
-                    self.normalize_rack_name_order(normalized_candidate),
-                }
+        for cached_racks in self.rack_lookup_cache.values():
+            for rack in cached_racks:
+                if rack.pk in seen_rack_ids:
+                    continue
+                seen_rack_ids.add(rack.pk)
+                possible_racks.append(rack)
 
-                if rack_variants & candidate_variants:
-                    return rack
-
-        # Conservative fallback: if the PM token and Nautobot rack share the
-        # same rack-number-like value, allow a contains match. This handles
-        # values like "Rack 101.02 Panel 2" or escaped-comma rack descriptors.
-        for rack in Rack.objects.all():
+        for rack in possible_racks:
             normalized_rack_name = self.normalize_pm_match_text(rack.name)
             rack_numbers = self.extract_rack_number_tokens(normalized_rack_name)
 
@@ -1075,14 +1155,8 @@ class PatchManagerImport(Job):
                 ):
                     return rack
 
-        self.logger.info(
-            "Rack lookup failed for value=%r candidates=%s",
-            value,
-            candidates,
-        )
         return None
 
-    @staticmethod
     def extract_rack_number_tokens(value: str) -> set:
         tokens = set()
 
@@ -1181,6 +1255,8 @@ class PatchManagerImport(Job):
             },
         )
 
+        self.add_rack_to_lookup_cache(rack)
+
         self.logger.info(
             "%s virtual rack %s for unresolved Patch Manager rack identifier",
             "Created" if created else "Updated",
@@ -1191,25 +1267,14 @@ class PatchManagerImport(Job):
 
     @staticmethod
     def find_virtual_rack_part(parts: List[str]) -> str:
-        virtual_keywords = (
-            "fdp",
-            "cage",
-            "panel",
-            "panels",
-            "netflix",
-        )
-
-        ignored_exact = {
-            "",
-        }
-
         # Prefer explicit infrastructure bucket tokens over locations and device names.
         for part in parts[3:]:
-            normalized = part.strip().lower()
-            if normalized in ignored_exact:
+            normalized = re.sub(r"\s+", " ", part.strip().lower())
+
+            if not normalized or normalized in IGNORED_RACK_LOOKUP_TOKENS:
                 continue
 
-            if any(keyword in normalized for keyword in virtual_keywords):
+            if any(keyword in normalized for keyword in RACK_LOOKUP_KEYWORDS):
                 return part.strip()
 
         return ""
