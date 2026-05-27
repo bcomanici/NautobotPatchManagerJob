@@ -1,3 +1,4 @@
+# Patch Manager import job version marker: notes-module-numeric-fix-v2
 """
 Nautobot Job: Import racks, devices, cables, and connection data from Patch Manager.
 """
