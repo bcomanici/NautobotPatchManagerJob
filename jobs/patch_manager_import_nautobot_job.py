@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 import requests
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError, transaction
+from django.db import DataError, IntegrityError, transaction
 from nautobot.apps.jobs import BooleanVar, ChoiceVar, IntegerVar, Job, StringVar
 from nautobot.dcim.models import Cable, Device, DeviceType, Interface, Location, LocationType, Manufacturer, Rack
 from nautobot.extras.models import Role, SecretsGroup, SecretsGroupAssociation, Status
@@ -57,6 +57,8 @@ DEFAULT_DEVICE_ROLE_NAME = "Patch Manager Imported"
 DEFAULT_PASSIVE_ROLE_NAME = "Patch Manager Passive Infrastructure"
 DEFAULT_PASSIVE_MANUFACTURER_NAME = "Generic"
 DEFAULT_RACK_HEIGHT = 45
+MAX_NAUTOBOT_NAME_LENGTH = 255
+MAX_INTERFACE_NAME_LENGTH = 255
 
 RACK_LOOKUP_KEYWORDS = (
     "rack",
@@ -340,16 +342,16 @@ class PatchManagerImport(Job):
             normalized_part = self.normalize_imported_rack_name_part(precise_part)
 
             if self.is_location_qualified_rack_id(normalized_part):
-                return f"{site_name} {normalized_part}".strip()
+                return self.safe_nautobot_name(f"{site_name} {normalized_part}".strip())
 
             if re.match(r"^\d+\.\d+\b", normalized_part):
                 return normalized_part
 
             if normalized_part.lower().startswith("rack "):
-                return f"{site_name} {normalized_part}"
+                return self.safe_nautobot_name(f"{site_name} {normalized_part}")
 
             if site_name.lower() not in normalized_part.lower():
-                return f"{site_name} {normalized_part}"
+                return self.safe_nautobot_name(f"{site_name} {normalized_part}")
 
             return normalized_part
 
@@ -811,11 +813,17 @@ class PatchManagerImport(Job):
         if not parsed:
             return None
 
-        parent_device = self.find_mounted_device_by_identifier_token(
-            token=parsed["parent_device"],
-            matched_racks=matched_racks,
-        )
+        # Priority 1: exact parent from parsed pattern.
+        parent_device = None
+        parent_token = parsed.get("parent_device", "")
+        if parent_token:
+            parent_device = self.find_mounted_device_by_identifier_token(
+                token=parent_token,
+                matched_racks=matched_racks,
+            )
 
+        # Priority 2: scan all identifier tokens right-to-left for any mounted
+        # parent device before passive infrastructure fallback.
         if not parent_device:
             parent_device = self.find_parent_device_by_right_to_left_scan(
                 identifier_parts=identifier_parts,
@@ -831,18 +839,28 @@ class PatchManagerImport(Job):
             )
             return None
 
-        interface_name = parsed["interface_name"]
+        interface_name = self.safe_interface_name(parsed["interface_name"])
         status = self.get_status()
 
-        interface, created = Interface.objects.get_or_create(
-            device=parent_device,
-            name=interface_name,
-            defaults={
-                "type": PORT_TYPE_DEFAULT,
-                "status": status,
-                "description": "",
-            },
-        )
+        try:
+            interface, created = Interface.objects.get_or_create(
+                device=parent_device,
+                name=interface_name,
+                defaults={
+                    "type": PORT_TYPE_DEFAULT,
+                    "status": status,
+                    "description": "",
+                },
+            )
+        except DataError as exc:
+            self.logger.warning(
+                "Interface name was too long for device %s; original=%r truncated=%r error=%s",
+                parent_device.name,
+                parsed["interface_name"],
+                interface_name,
+                exc,
+            )
+            return None
 
         update_needed = False
 
@@ -1020,6 +1038,14 @@ class PatchManagerImport(Job):
         return re.sub(r"\s+", " ", (value or "").strip())
 
     @staticmethod
+    def safe_interface_name(value: str) -> str:
+        name = re.sub(r"\s+", " ", (value or "").strip())
+        if len(name) <= MAX_INTERFACE_NAME_LENGTH:
+            return name
+
+        return name[:MAX_INTERFACE_NAME_LENGTH].rstrip()
+
+    @staticmethod
     def looks_like_interface_token(value: str) -> bool:
         token = re.sub(r"\s+", " ", (value or "").strip().lower())
 
@@ -1061,6 +1087,14 @@ class PatchManagerImport(Job):
 
         return False
 
+    @staticmethod
+    def safe_nautobot_name(value: str) -> str:
+        name = re.sub(r"\s+", " ", (value or "").strip())
+        if len(name) <= MAX_NAUTOBOT_NAME_LENGTH:
+            return name
+
+        return name[:MAX_NAUTOBOT_NAME_LENGTH].rstrip()
+
     def get_or_create_passive_infrastructure_device_for_row(
         self,
         row: Dict[str, Any],
@@ -1085,7 +1119,7 @@ class PatchManagerImport(Job):
         if not rack:
             return None
 
-        device_name = f"{rack.name} {bucket_type}"
+        device_name = self.safe_nautobot_name(f"{rack.name} {bucket_type}")
         device_type = self.get_or_create_passive_device_type(bucket_type)
         role = self.get_or_create_device_role(DEFAULT_PASSIVE_ROLE_NAME)
         status = self.get_status()
@@ -1119,7 +1153,7 @@ class PatchManagerImport(Job):
                     rack.name,
                 )
                 return device
-            except (ValidationError, IntegrityError) as exc:
+            except (ValidationError, IntegrityError, DataError) as exc:
                 self.logger.warning(
                     "Existing passive infrastructure placement is invalid for %s in rack=%s "
                     "position=%s face=%s: %s. Searching for a new valid U.",
@@ -1198,7 +1232,7 @@ class PatchManagerImport(Job):
                 )
                 raise
 
-            except IntegrityError:
+            except (IntegrityError, DataError):
                 failed_positions.append(f"{position}:integrity")
                 continue
 
@@ -1229,7 +1263,7 @@ class PatchManagerImport(Job):
             )
             return device
 
-        except (ValidationError, IntegrityError) as exc:
+        except (ValidationError, IntegrityError, DataError) as exc:
             self.logger.warning(
                 "Passive infrastructure fallback without rack position also failed for %s: %s",
                 device_name,
