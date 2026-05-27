@@ -265,6 +265,14 @@ class PatchManagerImport(Job):
                 skipped_port_detail_rows.append(row)
                 continue
 
+            if not rack:
+                self.logger.warning(
+                    "Device %s has a valid U position but no matching rack; importing without rack position.",
+                    name,
+                )
+                position = None
+                face = ""
+
             existing_device = Device.objects.filter(name=name).first()
 
             self.handle_front_rear_shared_position(rack, position, face, device_type)
@@ -306,6 +314,16 @@ class PatchManagerImport(Job):
                     defaults=device_defaults,
                 )
             except ValidationError as exc:
+                self.log_device_import_validation_issue(
+                    name=name,
+                    row=row,
+                    rack=rack,
+                    position=position,
+                    face=face,
+                    device_type=device_type,
+                    exc=exc,
+                )
+
                 if "position" not in getattr(exc, "message_dict", {}):
                     raise
 
@@ -320,14 +338,58 @@ class PatchManagerImport(Job):
                 )
 
                 device_defaults["position"] = None
-                device, created = Device.objects.update_or_create(
-                    name=name,
-                    defaults=device_defaults,
-                )
+                device_defaults["face"] = ""
+
+                try:
+                    device, created = Device.objects.update_or_create(
+                        name=name,
+                        defaults=device_defaults,
+                    )
+                except ValidationError as retry_exc:
+                    self.log_device_import_validation_issue(
+                        name=name,
+                        row=row,
+                        rack=rack,
+                        position=device_defaults.get("position"),
+                        face=device_defaults.get("face"),
+                        device_type=device_type,
+                        exc=retry_exc,
+                        retry=True,
+                    )
+                    raise
 
             self.logger.info("%s device %s", "Created" if created else "Updated", device.name)
 
         return skipped_port_detail_rows
+
+    def log_device_import_validation_issue(
+        self,
+        name: str,
+        row: Dict[str, Any],
+        rack: Optional[Rack],
+        position: Optional[int],
+        face: str,
+        device_type: DeviceType,
+        exc: ValidationError,
+        retry: bool = False,
+    ) -> None:
+        identifier = self.clean(row.get(self.fields["device_identifier"]))
+        equipment_position = self.clean(row.get(self.fields["device_position"]))
+        phase = "retry" if retry else "initial save"
+
+        self.logger.error(
+            "Device import validation issue during %s: device=%s rack=%s position=%s face=%r "
+            "device_type=%s equipment_position=%r equipment_identifier=%r error=%s",
+            phase,
+            name,
+            rack.name if rack else None,
+            position,
+            face,
+            device_type.model if device_type else None,
+            equipment_position,
+            identifier,
+            exc,
+        )
 
     def apply_skipped_device_port_details(self, rows: Iterable[Dict[str, Any]]) -> None:
         details_by_device_id: Dict[int, List[Dict[str, str]]] = {}
