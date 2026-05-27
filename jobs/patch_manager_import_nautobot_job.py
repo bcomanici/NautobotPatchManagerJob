@@ -57,6 +57,7 @@ DEFAULT_DEVICE_ROLE_NAME = "Patch Manager Imported"
 DEFAULT_PASSIVE_ROLE_NAME = "Patch Manager Passive Infrastructure"
 DEFAULT_PASSIVE_MANUFACTURER_NAME = "Generic"
 DEFAULT_RACK_HEIGHT = 45
+VIRTUAL_RACK_PREFIX = "Virtual"
 MAX_NAUTOBOT_NAME_LENGTH = 255
 MAX_INTERFACE_NAME_LENGTH = 255
 MAX_INTERFACE_DESCRIPTION_LENGTH = 255
@@ -2426,13 +2427,18 @@ class PatchManagerImport(Job):
         location: Optional[Location] = None,
     ) -> Optional[Rack]:
         """
-        Create a virtual rack only for unresolved non-rack infrastructure buckets.
+        Create a clearly marked virtual rack for unresolved non-rack infrastructure
+        buckets or location buckets.
 
-        This deliberately does NOT create virtual racks from:
-        - generic location hierarchy tokens
-        - actual rack-looking strings
-        - customer/descriptor tokens such as Netflix
-        - device names
+        These are normal Nautobot Rack objects, but they are intentionally named
+        with the "Virtual" prefix so they are distinguishable from physical
+        cabinets.
+
+        Examples:
+        - Virtual New York City - PoP DRT - Suite 804 Meet Me Room Non NYSERNet Panels
+        - Virtual Syracuse datacenter DC North
+        - Virtual 32 AoA DRT MMR Non NYSERNet Panels
+        - Virtual Albany - PoP Suite 510 - CenturyLink
         """
         if not identifier_parts:
             return None
@@ -2441,18 +2447,19 @@ class PatchManagerImport(Job):
         if not parts:
             return None
 
-        # If a real rack-looking value exists anywhere in the identifier, do not
-        # create a virtual rack. The real rack normalizer should handle it.
+        # If a real rack/cabinet-looking value exists anywhere in the identifier,
+        # do not create a virtual rack. The real rack normalizer should handle it.
         for part in parts:
             if self.looks_like_real_rack_reference(part):
                 return None
 
-        virtual_part = self.find_virtual_rack_part(parts)
-        if not virtual_part:
+        site_name = self.get_rack_name_prefix_from_identifier(parts)
+        virtual_bucket = self.build_virtual_rack_bucket_from_identifier(parts)
+
+        if not site_name or not virtual_bucket:
             return None
 
-        site_name = parts[0]
-        virtual_rack_name = self.normalize_virtual_rack_name(site_name, virtual_part)
+        virtual_rack_name = self.normalize_virtual_rack_name(site_name, virtual_bucket)
 
         if not virtual_rack_name:
             return None
@@ -2466,32 +2473,186 @@ class PatchManagerImport(Job):
             defaults={
                 "status": status,
                 "u_height": DEFAULT_RACK_HEIGHT,
-                "comments": "Virtual rack created by Patch Manager import for non-rack infrastructure grouping.",
+                "comments": "Virtual rack created by Patch Manager import for non-rack infrastructure/location grouping.",
             },
         )
 
         self.add_rack_to_lookup_cache(rack)
 
         self.logger.info(
-            "%s virtual rack %s for unresolved Patch Manager infrastructure bucket",
+            "%s virtual rack %s for unresolved Patch Manager infrastructure/location bucket",
             "Created" if created else "Updated",
             rack.name,
         )
 
         return rack
 
+    def build_virtual_rack_bucket_from_identifier(self, parts: List[str]) -> str:
+        """
+        Build the non-site portion of a virtual rack name from useful location
+        hierarchy/bucket tokens.
+
+        The goal is to capture room/suite/cage/MMR/panel context while ignoring:
+        - broad organizational buckets
+        - street addresses
+        - device hostnames
+        - numeric/interface/port tokens
+        """
+        if not parts:
+            return ""
+
+        prefix = self.get_rack_name_prefix_from_identifier(parts)
+        useful_parts: List[str] = []
+
+        # Skip broad group, site name, and address-ish fields by default, but
+        # allow specific room/suite/MMR/cage/panel fields through.
+        for part in parts[1:]:
+            cleaned = self.normalize_virtual_rack_part(part)
+            normalized = self.normalize_pm_match_text(cleaned)
+
+            if not cleaned or not normalized:
+                continue
+
+            if normalized == self.normalize_pm_match_text(prefix):
+                continue
+
+            if normalized in self.get_virtual_rack_ignored_tokens():
+                continue
+
+            if self.looks_like_real_rack_reference(cleaned):
+                continue
+
+            if self.looks_like_device_or_interface_identifier(cleaned):
+                continue
+
+            if self.looks_like_street_address_token(normalized):
+                continue
+
+            if self.is_useful_virtual_rack_context(cleaned):
+                if cleaned not in useful_parts:
+                    useful_parts.append(cleaned)
+
+        # If no explicit room/suite/panel terms were found, use the best
+        # remaining hierarchy component before the device/interface tokens.
+        if not useful_parts:
+            for part in parts[1:]:
+                cleaned = self.normalize_virtual_rack_part(part)
+                normalized = self.normalize_pm_match_text(cleaned)
+
+                if not cleaned or not normalized:
+                    continue
+
+                if normalized == self.normalize_pm_match_text(prefix):
+                    continue
+
+                if normalized in self.get_virtual_rack_ignored_tokens():
+                    continue
+
+                if self.looks_like_device_or_interface_identifier(cleaned):
+                    continue
+
+                if self.looks_like_street_address_token(normalized):
+                    continue
+
+                if cleaned not in useful_parts:
+                    useful_parts.append(cleaned)
+
+        return " ".join(useful_parts).strip()
+
     @staticmethod
-    def normalize_virtual_rack_name(site_name: str, virtual_part: str) -> str:
+    def normalize_virtual_rack_part(value: str) -> str:
+        part = (value or "").replace("<COMMA>", ",").strip()
+        part = re.sub(r"\s+", " ", part)
+        return part
+
+    @staticmethod
+    def get_virtual_rack_ignored_tokens() -> set:
+        return set(IGNORED_RACK_LOOKUP_TOKENS) | {
+            "nysernet backbone",
+            "customer locations",
+            "customer location",
+            "colocation",
+            "colo",
+            "nysernet cage",
+            "nysenet cage",
+        }
+
+    @staticmethod
+    def looks_like_street_address_token(normalized_value: str) -> bool:
+        return bool(
+            re.search(
+                r"\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|court|ct|drive|dr|broad|main|kelsy)",
+                normalized_value or "",
+            )
+        )
+
+    @staticmethod
+    def looks_like_device_or_interface_identifier(value: str) -> bool:
+        token = re.sub(r"\s+", " ", (value or "").strip().lower())
+
+        if not token:
+            return True
+
+        if re.match(r"^[a-z]{2,10}[a-z0-9]*-[a-z0-9][a-z0-9-]*$", token):
+            return True
+
+        if re.match(r"^\d+$", token):
+            return True
+
+        if "/" in token and re.search(r"\d+/\d+", token):
+            return True
+
+        if re.match(r"^(xe|ge|et|fe|te|gi|eth|qsfp|sfp|xfp|cfp)", token):
+            return True
+
+        return False
+
+    @staticmethod
+    def is_useful_virtual_rack_context(value: str) -> bool:
+        normalized = re.sub(r"\s+", " ", (value or "").strip().lower())
+
+        useful_keywords = (
+            "room",
+            "suite",
+            "mmr",
+            "meet me",
+            "cage",
+            "panel",
+            "panels",
+            "fdp",
+            "fiber",
+            "bulkhead",
+            "commscope",
+            "telect",
+            "dc north",
+            "dc south",
+            "danc",
+            "centurylink",
+            "crown castle",
+        )
+
+        return any(keyword in normalized for keyword in useful_keywords)
+
+    @staticmethod
+    def normalize_virtual_rack_name(site_name: str, virtual_bucket: str) -> str:
         site = re.sub(r"\s+", " ", (site_name or "").strip())
-        bucket = re.sub(r"\s+", " ", (virtual_part or "").strip())
+        bucket = re.sub(r"\s+", " ", (virtual_bucket or "").strip())
 
         if not site or not bucket:
             return ""
 
         if bucket.lower().startswith(site.lower()):
-            return bucket
+            base_name = bucket
+        else:
+            base_name = f"{site} {bucket}"
 
-        return f"{site} {bucket}"
+        if not base_name.lower().startswith(VIRTUAL_RACK_PREFIX.lower() + " "):
+            base_name = f"{VIRTUAL_RACK_PREFIX} {base_name}"
+
+        if len(base_name) > MAX_NAUTOBOT_NAME_LENGTH:
+            return base_name[:MAX_NAUTOBOT_NAME_LENGTH].rstrip()
+
+        return base_name
 
     @staticmethod
     def looks_like_real_rack_reference(value: str) -> bool:
@@ -2506,18 +2667,29 @@ class PatchManagerImport(Job):
         if re.search(r"^\d+\.\d+\b", normalized):
             return True
 
+        if re.search(r"\bcabinet\s+[a-z0-9-]+\b", normalized):
+            return True
+
+        if re.search(r"\b\d{5,}-colo-[a-z0-9-]+\b", normalized):
+            return True
+
         return False
 
     @staticmethod
     def find_virtual_rack_part(parts: List[str]) -> str:
         """
-        Pick only true infrastructure bucket tokens for virtual rack creation.
+        Backward-compatible helper. Prefer build_virtual_rack_bucket_from_identifier()
+        for new virtual rack naming.
         """
         virtual_keywords = (
             "fdp",
             "panel",
             "panels",
             "cage",
+            "fiber",
+            "bulkhead",
+            "commscope",
+            "telect",
         )
 
         ignored_exact = set(IGNORED_RACK_LOOKUP_TOKENS) | {
