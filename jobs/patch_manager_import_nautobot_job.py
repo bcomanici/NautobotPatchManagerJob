@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 import requests
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from nautobot.apps.jobs import BooleanVar, ChoiceVar, IntegerVar, Job, StringVar
 from nautobot.dcim.models import Cable, Device, DeviceType, Interface, Location, LocationType, Manufacturer, Rack
 from nautobot.extras.models import Role, SecretsGroup, SecretsGroupAssociation, Status
@@ -842,17 +842,37 @@ class PatchManagerImport(Job):
         base_defaults: Dict[str, Any],
     ) -> Optional[Device]:
         """
-        Try U positions from top to bottom and let Nautobot validation decide
-        whether the passive bucket can be placed there. This avoids false
-        positives where no device starts at U43 but another device occupies or
-        overlaps U43 due to height/full-depth rules.
+        Try U positions from top to bottom and let Nautobot/database validation
+        decide whether the passive bucket can be placed there.
+
+        This avoids false positives where no device starts at a U in a simple
+        query, but another device already occupies that rack/position/face or
+        overlaps the U because of height/full-depth rules.
         """
         failed_positions: List[str] = []
+
+        existing_device = Device.objects.filter(name=device_name).first()
 
         for position in range(rack.u_height, 0, -1):
             defaults = dict(base_defaults)
             defaults["position"] = position
             defaults["face"] = "front"
+
+            # Fast skip for the unique rack/position/face constraint. This is
+            # still followed by validated_save/update_or_create because Nautobot
+            # has additional occupancy rules beyond this DB constraint.
+            conflict_qs = Device.objects.filter(
+                rack=rack,
+                position=position,
+                face="front",
+            )
+
+            if existing_device:
+                conflict_qs = conflict_qs.exclude(pk=existing_device.pk)
+
+            if conflict_qs.exists():
+                failed_positions.append(f"{position}:occupied")
+                continue
 
             try:
                 device, created = Device.objects.update_or_create(
@@ -878,7 +898,18 @@ class PatchManagerImport(Job):
                     )
                     raise
 
-                failed_positions.append(str(position))
+                failed_positions.append(f"{position}:validation")
+                continue
+            except IntegrityError as exc:
+                # Race/DB-level rack-position-face collision. Try the next U.
+                failed_positions.append(f"{position}:integrity")
+                self.logger.info(
+                    "Passive infrastructure device %s could not use rack=%s U%s due to integrity conflict: %s",
+                    device_name,
+                    rack.name,
+                    position,
+                    exc,
+                )
                 continue
 
         self.logger.warning(
