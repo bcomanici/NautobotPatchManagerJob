@@ -845,12 +845,14 @@ class PatchManagerImport(Job):
         Try U positions from top to bottom and let Nautobot/database validation
         decide whether the passive bucket can be placed there.
 
-        This avoids false positives where no device starts at a U in a simple
-        query, but another device already occupies that rack/position/face or
-        overlaps the U because of height/full-depth rules.
+        Each attempt runs inside a nested transaction savepoint. This is
+        important because IntegrityError and some validation paths can leave the
+        surrounding transaction in a bad state if not isolated.
+
+        If no rack U is valid, keep the passive bucket device in the rack's
+        location without rack/position/face rather than failing the whole import.
         """
         failed_positions: List[str] = []
-
         existing_device = Device.objects.filter(name=device_name).first()
 
         for position in range(rack.u_height, 0, -1):
@@ -858,9 +860,6 @@ class PatchManagerImport(Job):
             defaults["position"] = position
             defaults["face"] = "front"
 
-            # Fast skip for the unique rack/position/face constraint. This is
-            # still followed by validated_save/update_or_create because Nautobot
-            # has additional occupancy rules beyond this DB constraint.
             conflict_qs = Device.objects.filter(
                 rack=rack,
                 position=position,
@@ -875,10 +874,12 @@ class PatchManagerImport(Job):
                 continue
 
             try:
-                device, created = Device.objects.update_or_create(
-                    name=device_name,
-                    defaults=defaults,
-                )
+                with transaction.atomic():
+                    device, created = Device.objects.update_or_create(
+                        name=device_name,
+                        defaults=defaults,
+                    )
+
                 self.logger.info(
                     "%s passive infrastructure device %s in rack %s at U%s",
                     "Created" if created else "Updated",
@@ -887,38 +888,62 @@ class PatchManagerImport(Job):
                     position,
                 )
                 return device
-            except ValidationError as exc:
-                if "position" not in getattr(exc, "message_dict", {}):
-                    self.logger.warning(
-                        "Passive infrastructure device %s failed non-position validation at rack=%s U%s: %s",
-                        device_name,
-                        rack.name,
-                        position,
-                        exc,
-                    )
-                    raise
 
-                failed_positions.append(f"{position}:validation")
-                continue
-            except IntegrityError as exc:
-                # Race/DB-level rack-position-face collision. Try the next U.
-                failed_positions.append(f"{position}:integrity")
-                self.logger.info(
-                    "Passive infrastructure device %s could not use rack=%s U%s due to integrity conflict: %s",
+            except ValidationError as exc:
+                # Any rack/position/face validation failure means this U is not
+                # usable for this passive bucket. Try the next U.
+                message_dict = getattr(exc, "message_dict", {})
+                if "position" in message_dict or "face" in message_dict:
+                    failed_positions.append(f"{position}:validation")
+                    continue
+
+                self.logger.warning(
+                    "Passive infrastructure device %s failed non-placement validation at rack=%s U%s: %s",
                     device_name,
                     rack.name,
                     position,
                     exc,
                 )
+                raise
+
+            except IntegrityError as exc:
+                failed_positions.append(f"{position}:integrity")
                 continue
 
         self.logger.warning(
-            "Passive infrastructure device %s could not be placed in rack %s. Tried U positions: %s",
+            "Passive infrastructure device %s could not be placed in rack %s. Tried U positions: %s. "
+            "Creating/updating it without rack position.",
             device_name,
             rack.name,
             ", ".join(failed_positions),
         )
-        return None
+
+        fallback_defaults = dict(base_defaults)
+        fallback_defaults["rack"] = None
+        fallback_defaults["position"] = None
+        fallback_defaults["face"] = ""
+
+        try:
+            with transaction.atomic():
+                device, created = Device.objects.update_or_create(
+                    name=device_name,
+                    defaults=fallback_defaults,
+                )
+
+            self.logger.info(
+                "%s passive infrastructure device %s without rack position",
+                "Created" if created else "Updated",
+                device.name,
+            )
+            return device
+
+        except ValidationError as exc:
+            self.logger.warning(
+                "Passive infrastructure fallback without rack position also failed for %s: %s",
+                device_name,
+                exc,
+            )
+            return None
 
     def detect_passive_infrastructure_bucket(self, identifier_parts: List[str]) -> str:
         for part in identifier_parts:
