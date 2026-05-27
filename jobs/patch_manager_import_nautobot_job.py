@@ -1848,8 +1848,22 @@ class PatchManagerImport(Job):
         if not value:
             return None, "front"
 
-        u_match = re.search(r"\bU\s*(\d+)\b", value, re.IGNORECASE)
-        position = int(u_match.group(1)) if u_match else None
+        # Only accept explicit rack-unit notation:
+        # - U45
+        # - U 45
+        # - 45U
+        #
+        # Do not treat physical dimensions such as "2.45', 1.33', 0'" as U45.
+        u_match = re.search(
+            r"(?<![\d.])U\s*(\d+)\b|\b(\d+)\s*U\b",
+            value,
+            re.IGNORECASE,
+        )
+
+        if u_match:
+            position = int(u_match.group(1) or u_match.group(2))
+        else:
+            position = None
 
         face_match = re.search(r"\b(front|rear)\b", value, re.IGNORECASE)
         face = face_match.group(1).lower() if face_match else "front"
