@@ -58,6 +58,8 @@ DEFAULT_RACK_HEIGHT = 42
 
 RACK_LOOKUP_KEYWORDS = (
     "rack",
+    "cabinet",
+    "colo",
     "fdp",
     "cage",
     "panel",
@@ -581,8 +583,11 @@ class PatchManagerImport(Job):
 
             if not rack:
                 self.logger.warning(
-                    "Device %s has a valid U position but no matching rack; importing without rack position.",
+                    "Device %s has a valid U position but no matching rack; importing without rack position. "
+                    "Equipment Position=%r Equipment Identifier=%r",
                     name,
+                    self.clean(row.get(self.fields["device_position"])),
+                    self.clean(row.get(self.fields["device_identifier"])),
                 )
                 position = None
                 face = ""
@@ -1209,17 +1214,7 @@ class PatchManagerImport(Job):
         self.rack_lookup_cache = {}
 
         for rack in Rack.objects.all().select_related("location"):
-            keys = {
-                self.normalize_pm_match_text(rack.name),
-                self.normalize_rack_name_order(self.normalize_pm_match_text(rack.name)),
-            }
-
-            for number_token in self.extract_rack_number_tokens(rack.name):
-                keys.add(number_token)
-
-            for key in keys:
-                if not key:
-                    continue
+            for key in self.extract_rack_lookup_keys(rack.name):
                 self.rack_lookup_cache.setdefault(key, []).append(rack)
 
         self.rack_lookup_cache_loaded = True
@@ -1228,20 +1223,39 @@ class PatchManagerImport(Job):
         if not self.rack_lookup_cache_loaded:
             return
 
-        keys = {
-            self.normalize_pm_match_text(rack.name),
-            self.normalize_rack_name_order(self.normalize_pm_match_text(rack.name)),
-        }
-
-        for number_token in self.extract_rack_number_tokens(rack.name):
-            keys.add(number_token)
-
-        for key in keys:
-            if not key:
-                continue
+        for key in self.extract_rack_lookup_keys(rack.name):
             cached_racks = self.rack_lookup_cache.setdefault(key, [])
             if rack not in cached_racks:
                 cached_racks.append(rack)
+
+    def extract_rack_lookup_keys(self, value: str) -> set:
+        normalized = self.normalize_pm_match_text((value or "").replace("<COMMA>", ","))
+
+        if not normalized:
+            return set()
+
+        keys = {
+            normalized,
+            self.normalize_rack_name_order(normalized),
+        }
+
+        for number_token in self.extract_rack_number_tokens(normalized):
+            keys.add(number_token)
+            keys.add(f"rack {number_token}")
+
+        cabinet_match = re.search(r"\bcabinet\s+([a-z0-9-]+)\b", normalized)
+        if cabinet_match:
+            keys.add(f"cabinet {cabinet_match.group(1)}")
+
+        colo_match = re.search(r"\b(\d{5,}-colo-[a-z0-9-]+)\b", normalized)
+        if colo_match:
+            keys.add(colo_match.group(1))
+
+        decimal_match = re.search(r"^(\d+\.\d+\b.*)$", normalized)
+        if decimal_match:
+            keys.add(decimal_match.group(1).strip())
+
+        return {key for key in keys if key}
 
     def should_attempt_rack_lookup(self, value: str) -> bool:
         normalized = self.normalize_pm_match_text(value)
@@ -1249,7 +1263,7 @@ class PatchManagerImport(Job):
         if not normalized or normalized in IGNORED_RACK_LOOKUP_TOKENS:
             return False
 
-        if self.extract_rack_number_tokens(normalized):
+        if self.extract_rack_lookup_keys(normalized):
             return True
 
         return any(keyword in normalized for keyword in RACK_LOOKUP_KEYWORDS)
@@ -1263,13 +1277,7 @@ class PatchManagerImport(Job):
 
         for candidate in candidates:
             normalized_candidate = self.normalize_pm_match_text(candidate)
-            candidate_keys = {
-                normalized_candidate,
-                self.normalize_rack_name_order(normalized_candidate),
-            }
-
-            for number_token in self.extract_rack_number_tokens(normalized_candidate):
-                candidate_keys.add(number_token)
+            candidate_keys = self.extract_rack_lookup_keys(normalized_candidate)
 
             for key in candidate_keys:
                 cached_matches = self.rack_lookup_cache.get(key, [])
