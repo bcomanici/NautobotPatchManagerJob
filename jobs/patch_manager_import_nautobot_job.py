@@ -2247,6 +2247,7 @@ class PatchManagerImport(Job):
 
             should_attempt = self.should_attempt_rack_lookup(clean_part)
             candidates = self.get_rack_lookup_candidates(clean_part) if should_attempt else []
+            contextual_candidates = self.get_contextual_rack_lookup_candidates(clean_part, identifier_parts) if should_attempt else []
             matches = []
 
             if should_attempt:
@@ -2255,7 +2256,8 @@ class PatchManagerImport(Job):
 
             descriptions.append(
                 f"part={clean_part!r}; should_attempt={should_attempt}; "
-                f"candidates={candidates!r}; matches={matches!r}"
+                f"candidates={candidates!r}; contextual_candidates={contextual_candidates!r}; "
+                f"matches={matches!r}"
             )
 
         return " | ".join(descriptions)
@@ -2268,13 +2270,21 @@ class PatchManagerImport(Job):
         """
         Resolve a rack token using all identifier context.
 
-        This handles ambiguous aliases such as "Cabinet 0316" by first finding
-        all rack candidates for that alias, then choosing the candidate whose
-        rack name best overlaps the rest of the identifier path, such as:
-        - Ashburn VA - PoP
-        - Binghamton - PoP
-        - New York City - PoP
+        Handles ambiguous aliases such as "Cabinet 0316", and generic rack
+        tokens such as "Rack", "Rack 45Ux19x40 Plan 22x8", or
+        "Rack - 02.B1.21" by generating context-qualified candidates like:
+        - Albion Rack
+        - Brockport - SUNY Brockport Rack 45Ux19x40 Plan 22x8
+        - Philadelphia PA - PoP Rack - 02.B1.21
         """
+        for qualified_candidate in self.get_contextual_rack_lookup_candidates(value, identifier_parts):
+            candidates = self.find_rack_candidates(qualified_candidate)
+            if candidates:
+                if len(candidates) == 1:
+                    return candidates[0]
+
+                return self.choose_best_rack_candidate(candidates, identifier_parts) or candidates[0]
+
         candidates = self.find_rack_candidates(value)
         if not candidates:
             return None
@@ -2283,6 +2293,54 @@ class PatchManagerImport(Job):
             return candidates[0]
 
         return self.choose_best_rack_candidate(candidates, identifier_parts) or candidates[0]
+
+    def get_contextual_rack_lookup_candidates(
+        self,
+        value: str,
+        identifier_parts: List[str],
+    ) -> List[str]:
+        clean_value = self.clean(value).replace("<COMMA>", ",")
+
+        if not clean_value or not self.is_generic_rack_lookup_token(clean_value):
+            return []
+
+        prefix = self.get_rack_name_prefix_from_identifier(identifier_parts)
+        if not prefix:
+            return []
+
+        candidates = [
+            f"{prefix} {clean_value}",
+        ]
+
+        normalized_value = self.normalize_imported_rack_name_part(clean_value)
+        if normalized_value != clean_value:
+            candidates.append(f"{prefix} {normalized_value}")
+
+        unique_candidates: List[str] = []
+        for candidate in candidates:
+            candidate = re.sub(r"\s+", " ", candidate.strip())
+            if candidate and candidate not in unique_candidates:
+                unique_candidates.append(candidate)
+
+        return unique_candidates
+
+    @staticmethod
+    def is_generic_rack_lookup_token(value: str) -> bool:
+        normalized = re.sub(r"\s+", " ", (value or "").strip().lower())
+
+        if not normalized:
+            return False
+
+        if normalized == "rack":
+            return True
+
+        if normalized.startswith("rack "):
+            return True
+
+        if normalized.startswith("rack -"):
+            return True
+
+        return False
 
     def get_or_create_virtual_rack_from_identifier_parts(
         self,
