@@ -1479,6 +1479,18 @@ class PatchManagerImport(Job):
                 cached_racks.append(rack)
 
     def extract_rack_lookup_keys(self, value: str) -> set:
+        """
+        Build deterministic rack lookup aliases from either a Patch Manager
+        identifier token or an imported Nautobot rack name.
+
+        This makes these imported rack names directly discoverable by their
+        short aliases during device placement:
+
+        - Ashburn VA - PoP Cabinet 0316 -> cabinet 0316
+        - Binghamton - PoP Cabinet 001 -> cabinet 001
+        - New York City - PoP 177828-COLO-CCF -> 177828-colo-ccf
+        - 2405.14 NYPH -> 2405.14 nyph
+        """
         normalized = self.normalize_pm_match_text((value or "").replace("<COMMA>", ","))
 
         if not normalized:
@@ -1489,21 +1501,28 @@ class PatchManagerImport(Job):
             self.normalize_rack_name_order(normalized),
         }
 
+        # Rack-number aliases.
         for number_token in self.extract_rack_number_tokens(normalized):
             keys.add(number_token)
             keys.add(f"rack {number_token}")
 
-        cabinet_match = re.search(r"\bcabinet\s+([a-z0-9-]+)\b", normalized)
-        if cabinet_match:
+        # Cabinet aliases, anywhere in the name/token.
+        for cabinet_match in re.finditer(r"\bcabinet\s+([a-z0-9-]+)\b", normalized):
             keys.add(f"cabinet {cabinet_match.group(1)}")
 
-        colo_match = re.search(r"\b(\d{5,}-colo-[a-z0-9-]+)\b", normalized)
-        if colo_match:
+        # COLO cabinet aliases, anywhere in the name/token.
+        for colo_match in re.finditer(r"\b(\d{5,}-colo-[a-z0-9-]+)\b", normalized):
             keys.add(colo_match.group(1))
 
+        # Leading decimal rack aliases, preserving the whole token.
         decimal_match = re.search(r"^(\d+\.\d+\b.*)$", normalized)
         if decimal_match:
             keys.add(decimal_match.group(1).strip())
+
+        # Also add embedded decimal rack aliases when they look like cabinet IDs
+        # or rack/location IDs in a longer imported rack name.
+        for embedded_decimal in re.finditer(r"\b(\d+\.\d+\b[^,]*)", normalized):
+            keys.add(embedded_decimal.group(1).strip())
 
         return {key for key in keys if key}
 
