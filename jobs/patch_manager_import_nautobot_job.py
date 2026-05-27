@@ -2308,12 +2308,27 @@ class PatchManagerImport(Job):
         if not prefix:
             return []
 
-        candidates = [
-            f"{prefix} {clean_value}",
-        ]
+        candidates: List[str] = []
+
+        # If the rack token is generic/plain, also include the hierarchy token
+        # immediately before it. This handles identifiers like:
+        #   NYSERNet Backbone,Rochester - PoPs,211 Bailey Rd...,Telco Room,Rack,Bailey-3000r7
+        # matching imported rack:
+        #   Rochester - PoPs Telco Room Rack
+        previous_context = self.get_identifier_token_before_value(
+            value=clean_value,
+            identifier_parts=identifier_parts,
+        )
+
+        if previous_context and self.should_use_previous_rack_context(previous_context, prefix):
+            candidates.append(f"{prefix} {previous_context} {clean_value}")
+
+        candidates.append(f"{prefix} {clean_value}")
 
         normalized_value = self.normalize_imported_rack_name_part(clean_value)
         if normalized_value != clean_value:
+            if previous_context and self.should_use_previous_rack_context(previous_context, prefix):
+                candidates.append(f"{prefix} {previous_context} {normalized_value}")
             candidates.append(f"{prefix} {normalized_value}")
 
         unique_candidates: List[str] = []
@@ -2323,6 +2338,55 @@ class PatchManagerImport(Job):
                 unique_candidates.append(candidate)
 
         return unique_candidates
+
+    def get_identifier_token_before_value(
+        self,
+        value: str,
+        identifier_parts: List[str],
+    ) -> str:
+        normalized_value = self.normalize_pm_match_text(value)
+
+        if not normalized_value:
+            return ""
+
+        for index, part in enumerate(identifier_parts):
+            if self.normalize_pm_match_text(part.replace("<COMMA>", ",")) == normalized_value:
+                if index > 0:
+                    return self.clean(identifier_parts[index - 1]).replace("<COMMA>", ",")
+                return ""
+
+        return ""
+
+    def should_use_previous_rack_context(self, previous_context: str, prefix: str) -> bool:
+        normalized_context = self.normalize_pm_match_text(previous_context)
+        normalized_prefix = self.normalize_pm_match_text(prefix)
+
+        if not normalized_context:
+            return False
+
+        if normalized_context == normalized_prefix:
+            return False
+
+        ignored = set(IGNORED_RACK_LOOKUP_TOKENS) | {
+            "nysernet backbone",
+            "customer locations",
+            "customer location",
+            "colocation",
+            "colo",
+        }
+
+        if normalized_context in ignored:
+            return False
+
+        # Avoid pure street addresses; location rooms/suites/telco rooms are useful.
+        if re.search(r"\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|court|ct|drive|dr)", normalized_context):
+            return False
+
+        # Avoid using device-looking hostnames as rack context.
+        if re.match(r"^[a-z]{2,10}[a-z0-9]*-[a-z0-9][a-z0-9-]*$", normalized_context):
+            return False
+
+        return True
 
     @staticmethod
     def is_generic_rack_lookup_token(value: str) -> bool:
