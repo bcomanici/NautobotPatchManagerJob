@@ -780,54 +780,114 @@ class PatchManagerImport(Job):
         status = self.get_status()
 
         existing_device = Device.objects.filter(name=device_name).first()
-        position = existing_device.position if existing_device else self.find_highest_available_rack_u(rack)
-        face = existing_device.face if existing_device else "front"
 
-        defaults = {
+        base_defaults = {
             "device_type": device_type,
             "role": role,
             "status": status,
             "location": rack.location,
             "rack": rack,
-            "position": position,
-            "face": face or "front",
             "comments": f"Passive infrastructure bucket created by Patch Manager import: {bucket_type}",
         }
 
-        if position is None:
-            defaults["rack"] = rack
-            defaults["position"] = None
-            defaults["face"] = ""
+        if existing_device:
+            defaults = dict(base_defaults)
+            defaults["position"] = existing_device.position
+            defaults["face"] = existing_device.face or "front"
 
-        try:
-            device, created = Device.objects.update_or_create(
-                name=device_name,
-                defaults=defaults,
-            )
-        except ValidationError as exc:
-            self.logger.warning(
-                "Passive infrastructure device placement failed for %s in rack=%s position=%s: %s. "
-                "Retrying without rack position.",
-                device_name,
-                rack.name,
-                position,
-                exc,
-            )
-            defaults["position"] = None
-            defaults["face"] = ""
-            device, created = Device.objects.update_or_create(
-                name=device_name,
-                defaults=defaults,
-            )
+            try:
+                device, created = Device.objects.update_or_create(
+                    name=device_name,
+                    defaults=defaults,
+                )
+                self.logger.info(
+                    "%s passive infrastructure device %s in rack %s",
+                    "Created" if created else "Updated",
+                    device.name,
+                    rack.name,
+                )
+                return device
+            except ValidationError as exc:
+                self.logger.warning(
+                    "Existing passive infrastructure placement is invalid for %s in rack=%s "
+                    "position=%s face=%s: %s. Searching for a new valid U.",
+                    device_name,
+                    rack.name,
+                    existing_device.position,
+                    existing_device.face,
+                    exc,
+                )
 
-        self.logger.info(
-            "%s passive infrastructure device %s in rack %s",
-            "Created" if created else "Updated",
-            device.name,
-            rack.name,
+        device = self.create_or_update_passive_device_in_first_valid_u(
+            device_name=device_name,
+            rack=rack,
+            base_defaults=base_defaults,
         )
 
-        return device
+        if device:
+            return device
+
+        self.logger.warning(
+            "Could not find any valid U position for passive infrastructure device %s in rack %s. "
+            "Leaving row unmatched.",
+            device_name,
+            rack.name,
+        )
+        return None
+
+    def create_or_update_passive_device_in_first_valid_u(
+        self,
+        device_name: str,
+        rack: Rack,
+        base_defaults: Dict[str, Any],
+    ) -> Optional[Device]:
+        """
+        Try U positions from top to bottom and let Nautobot validation decide
+        whether the passive bucket can be placed there. This avoids false
+        positives where no device starts at U43 but another device occupies or
+        overlaps U43 due to height/full-depth rules.
+        """
+        failed_positions: List[str] = []
+
+        for position in range(rack.u_height, 0, -1):
+            defaults = dict(base_defaults)
+            defaults["position"] = position
+            defaults["face"] = "front"
+
+            try:
+                device, created = Device.objects.update_or_create(
+                    name=device_name,
+                    defaults=defaults,
+                )
+                self.logger.info(
+                    "%s passive infrastructure device %s in rack %s at U%s",
+                    "Created" if created else "Updated",
+                    device.name,
+                    rack.name,
+                    position,
+                )
+                return device
+            except ValidationError as exc:
+                if "position" not in getattr(exc, "message_dict", {}):
+                    self.logger.warning(
+                        "Passive infrastructure device %s failed non-position validation at rack=%s U%s: %s",
+                        device_name,
+                        rack.name,
+                        position,
+                        exc,
+                    )
+                    raise
+
+                failed_positions.append(str(position))
+                continue
+
+        self.logger.warning(
+            "Passive infrastructure device %s could not be placed in rack %s. Tried U positions: %s",
+            device_name,
+            rack.name,
+            ", ".join(failed_positions),
+        )
+        return None
 
     def detect_passive_infrastructure_bucket(self, identifier_parts: List[str]) -> str:
         for part in identifier_parts:
@@ -882,6 +942,10 @@ class PatchManagerImport(Job):
         return device_type
 
     def find_highest_available_rack_u(self, rack: Rack) -> Optional[int]:
+        """
+        Retained for compatibility. Passive placement now validates candidate
+        positions top-down instead of trusting this simple starting-U check.
+        """
         used_positions = set(
             Device.objects.filter(rack=rack)
             .exclude(position__isnull=True)
@@ -892,10 +956,6 @@ class PatchManagerImport(Job):
             if position not in used_positions:
                 return position
 
-        self.logger.warning(
-            "No available U positions found in rack %s for passive infrastructure device",
-            rack.name,
-        )
         return None
 
     def find_imported_device_in_identifier(self, value: str) -> Optional[Device]:
