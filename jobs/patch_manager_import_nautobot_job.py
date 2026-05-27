@@ -2489,23 +2489,23 @@ class PatchManagerImport(Job):
 
     def build_virtual_rack_bucket_from_identifier(self, parts: List[str]) -> str:
         """
-        Build the non-site portion of a virtual rack name from useful location
-        hierarchy/bucket tokens.
+        Build a canonical virtual rack bucket from useful room/suite/cage/MMR
+        context while avoiding duplicate virtual racks for the same suite.
 
-        The goal is to capture room/suite/cage/MMR/panel context while ignoring:
-        - broad organizational buckets
-        - street addresses
-        - device hostnames
-        - numeric/interface/port tokens
+        Examples:
+        - DRT - Suite 804 + Meet Me Room -> Suite 804 MMR
+        - Suite 804 + Meet Me Room -> Suite 804 MMR
+        - Crown Castle - Suite 801 -> Suite 801 Crown Castle
+        - NYSERNet Cage -> NYSERNet Cage
+        - DC North -> DC North
         """
         if not parts:
             return ""
 
         prefix = self.get_rack_name_prefix_from_identifier(parts)
-        useful_parts: List[str] = []
+        normalized_prefix = self.normalize_pm_match_text(prefix)
 
-        # Skip broad group, site name, and address-ish fields by default, but
-        # allow specific room/suite/MMR/cage/panel fields through.
+        cleaned_parts: List[str] = []
         for part in parts[1:]:
             cleaned = self.normalize_virtual_rack_part(part)
             normalized = self.normalize_pm_match_text(cleaned)
@@ -2513,7 +2513,7 @@ class PatchManagerImport(Job):
             if not cleaned or not normalized:
                 continue
 
-            if normalized == self.normalize_pm_match_text(prefix):
+            if normalized == normalized_prefix:
                 continue
 
             if normalized in self.get_virtual_rack_ignored_tokens():
@@ -2528,36 +2528,81 @@ class PatchManagerImport(Job):
             if self.looks_like_street_address_token(normalized):
                 continue
 
+            cleaned_parts.append(cleaned)
+
+        canonical = self.canonicalize_virtual_rack_bucket(cleaned_parts)
+        if canonical:
+            return canonical
+
+        useful_parts: List[str] = []
+        for cleaned in cleaned_parts:
             if self.is_useful_virtual_rack_context(cleaned):
                 if cleaned not in useful_parts:
                     useful_parts.append(cleaned)
 
-        # If no explicit room/suite/panel terms were found, use the best
-        # remaining hierarchy component before the device/interface tokens.
-        if not useful_parts:
-            for part in parts[1:]:
-                cleaned = self.normalize_virtual_rack_part(part)
-                normalized = self.normalize_pm_match_text(cleaned)
-
-                if not cleaned or not normalized:
-                    continue
-
-                if normalized == self.normalize_pm_match_text(prefix):
-                    continue
-
-                if normalized in self.get_virtual_rack_ignored_tokens():
-                    continue
-
-                if self.looks_like_device_or_interface_identifier(cleaned):
-                    continue
-
-                if self.looks_like_street_address_token(normalized):
-                    continue
-
-                if cleaned not in useful_parts:
-                    useful_parts.append(cleaned)
-
         return " ".join(useful_parts).strip()
+
+    def canonicalize_virtual_rack_bucket(self, cleaned_parts: List[str]) -> str:
+        """
+        Collapse similar virtual rack location strings into one canonical bucket.
+        """
+        if not cleaned_parts:
+            return ""
+
+        joined = " ".join(cleaned_parts)
+        joined_norm = self.normalize_pm_match_text(joined)
+
+        suite = self.extract_suite_token(joined)
+        has_mmr = bool(re.search(r"\b(mmr|meet\s+me\s+room)\b", joined, re.IGNORECASE))
+        has_crown_castle = "crown castle" in joined_norm
+        has_drt = "drt" in joined_norm
+        has_non_nysernet_panels = "non nysernet panel" in joined_norm
+        has_nysernet_cage = "nysernet cage" in joined_norm or "nysenet cage" in joined_norm
+        dc_match = re.search(r"\bdc\s+(north|south|east|west)\b", joined, re.IGNORECASE)
+
+        if suite:
+            pieces = [suite]
+
+            if has_crown_castle:
+                pieces.append("Crown Castle")
+
+            if has_mmr or has_drt:
+                pieces.append("MMR")
+
+            if has_non_nysernet_panels:
+                pieces.append("Non NYSERNet Panels")
+
+            return " ".join(pieces)
+
+        if has_nysernet_cage:
+            if has_non_nysernet_panels:
+                return "NYSERNet Cage Non NYSERNet Panels"
+            return "NYSERNet Cage"
+
+        if dc_match:
+            return f"DC {dc_match.group(1).capitalize()}"
+
+        # Known room/location buckets.
+        for cleaned in cleaned_parts:
+            normalized = self.normalize_pm_match_text(cleaned)
+            if "telco room" in normalized:
+                return "Telco Room"
+            if "meet me room" in normalized or normalized == "mmr":
+                return "MMR"
+            if "danc" in normalized:
+                return "DANC"
+            if "centurylink" in normalized:
+                return cleaned
+
+        return ""
+
+    @staticmethod
+    def extract_suite_token(value: str) -> str:
+        match = re.search(r"\bsuite\s*([a-z0-9-]+)\b", value or "", re.IGNORECASE)
+        if not match:
+            return ""
+
+        return f"Suite {match.group(1).upper()}"
 
     @staticmethod
     def normalize_virtual_rack_part(value: str) -> str:
