@@ -726,11 +726,16 @@ class PatchManagerImport(Job):
 
     def apply_skipped_device_port_details(self, rows: Iterable[Dict[str, Any]]) -> None:
         details_by_device_id: Dict[int, List[Dict[str, str]]] = {}
+        details_by_interface_id: Dict[int, List[Dict[str, str]]] = {}
 
         for row in rows:
-            target_device = self.find_imported_device_in_identifier(
-                self.clean(row.get(self.fields["device_identifier"]))
-            )
+            identifier = self.clean(row.get(self.fields["device_identifier"]))
+            target_interface = self.get_or_create_interface_for_child_row(row)
+
+            if target_interface:
+                target_device = target_interface.device
+            else:
+                target_device = self.find_imported_device_in_identifier(identifier)
 
             if not target_device:
                 target_device = self.get_or_create_passive_infrastructure_device_for_row(row)
@@ -754,7 +759,27 @@ class PatchManagerImport(Job):
 
             self.mark_no_valid_u_outcome(row, "attached_with_port_details", target_device)
 
-            details_by_device_id.setdefault(target_device.pk, []).append(details)
+            if target_interface:
+                details_by_interface_id.setdefault(target_interface.pk, []).append(details)
+            else:
+                details_by_device_id.setdefault(target_device.pk, []).append(details)
+
+        for interface_id, detail_rows in details_by_interface_id.items():
+            interface = Interface.objects.select_related("device").get(pk=interface_id)
+            updated_description = self.replace_pm_port_details_block(
+                getattr(interface, "description", "") or "",
+                detail_rows,
+            )
+
+            # Interface details are stored on the interface itself. Direct
+            # update avoids revalidating unrelated device rack placement.
+            Interface.objects.filter(pk=interface.pk).update(description=updated_description)
+
+            self.logger.info(
+                "Updated Patch Manager port details on interface %s:%s",
+                interface.device.name,
+                interface.name,
+            )
 
         for device_id, detail_rows in details_by_device_id.items():
             device = Device.objects.get(pk=device_id)
@@ -766,6 +791,92 @@ class PatchManagerImport(Job):
             Device.objects.filter(pk=device.pk).update(comments=updated_comments)
 
             self.logger.info("Updated Patch Manager port details on device %s", device.name)
+
+    def get_or_create_interface_for_child_row(
+        self,
+        row: Dict[str, Any],
+    ) -> Optional[Interface]:
+        identifier = self.clean(row.get(self.fields["device_identifier"]))
+        if not identifier:
+            return None
+
+        identifier_parts = self.split_equipment_identifier_for_matching(identifier)
+        matched_racks = self.find_racks_in_identifier(identifier_parts)
+        parsed = self.parse_child_interface_identifier(identifier_parts)
+
+        if not parsed:
+            return None
+
+        parent_device = self.find_mounted_device_by_identifier_token(
+            token=parsed["parent_device"],
+            matched_racks=matched_racks,
+        )
+
+        if not parent_device:
+            return None
+
+        interface_name = parsed["interface_name"]
+        status = self.get_status()
+
+        interface, created = Interface.objects.get_or_create(
+            device=parent_device,
+            name=interface_name,
+            defaults={
+                "type": PORT_TYPE_DEFAULT,
+                "status": status,
+                "description": "",
+            },
+        )
+
+        update_fields = []
+
+        if not interface.status_id:
+            interface.status = status
+            update_fields.append("status")
+
+        if not getattr(interface, "type", None):
+            interface.type = PORT_TYPE_DEFAULT
+            update_fields.append("type")
+
+        if update_fields:
+            interface.validated_save()
+
+        self.logger.info(
+            "%s interface %s on device %s from Patch Manager child/interface row",
+            "Created" if created else "Updated",
+            interface.name,
+            parent_device.name,
+        )
+
+        return interface
+
+    def parse_child_interface_identifier(self, identifier_parts: List[str]) -> Optional[Dict[str, str]]:
+        """
+        Parse Patch Manager child/interface identifiers.
+
+        Common pattern:
+            ..., <parent-device>, <slot-or-port-index>, <interface-name>
+
+        Example:
+            ..., pts-5110, 1, xe-0/0/1
+        """
+        if len(identifier_parts) < 3:
+            return None
+
+        interface_token = identifier_parts[-1]
+        slot_token = identifier_parts[-2]
+        parent_token = identifier_parts[-3]
+
+        if not self.looks_like_interface_token(interface_token):
+            return None
+
+        if not self.looks_like_slot_or_port_index(slot_token):
+            return None
+
+        return {
+            "parent_device": parent_token,
+            "interface_name": interface_token.strip(),
+        }
 
     def get_or_create_passive_infrastructure_device_for_row(
         self,
@@ -1018,6 +1129,17 @@ class PatchManagerImport(Job):
         identifier_parts = self.split_equipment_identifier_for_matching(identifier)
         matched_racks = self.find_racks_in_identifier(identifier_parts)
 
+        child_parent_match = self.find_device_by_child_interface_pattern(
+            identifier_parts=identifier_parts,
+            matched_racks=matched_racks,
+        )
+        if child_parent_match:
+            self.logger.info(
+                "Matched skipped port detail row using child/interface parent inference: %s",
+                child_parent_match.name,
+            )
+            return child_parent_match
+
         rack_scoped_match = self.find_device_by_rack_scoped_contains(
             matched_racks=matched_racks,
             identifier=identifier,
@@ -1041,6 +1163,107 @@ class PatchManagerImport(Job):
     def split_equipment_identifier_for_matching(self, value: str) -> List[str]:
         normalized = (value or "").replace("<COMMA>", ",")
         return [part.strip() for part in normalized.split(",") if part.strip()]
+
+    def find_device_by_child_interface_pattern(
+        self,
+        identifier_parts: List[str],
+        matched_racks: List[Rack],
+    ) -> Optional[Device]:
+        """
+        Resolve Patch Manager child/interface rows to their parent chassis.
+
+        Common Patch Manager pattern:
+            ..., <parent-device>, <module-or-port-index>, <interface-name>
+
+        Example:
+            ..., pts-5110, 1, xe-0/0/1
+        should resolve to device "pts-5110".
+
+        This is intentionally conservative:
+        - final token must look like an interface/port name
+        - token before it must be numeric or slot-like
+        - token before that must match an existing mounted device name
+        """
+        if len(identifier_parts) < 3:
+            return None
+
+        interface_token = identifier_parts[-1]
+        slot_token = identifier_parts[-2]
+        parent_token = identifier_parts[-3]
+
+        if not self.looks_like_interface_token(interface_token):
+            return None
+
+        if not self.looks_like_slot_or_port_index(slot_token):
+            return None
+
+        return self.find_mounted_device_by_identifier_token(
+            token=parent_token,
+            matched_racks=matched_racks,
+        )
+
+    @staticmethod
+    def looks_like_interface_token(value: str) -> bool:
+        token = (value or "").strip().lower()
+
+        if not token:
+            return False
+
+        interface_patterns = (
+            r"^(xe|ge|et|fe|te|gi|fo|hundredgige|tengige|ethernet|eth|mgmt|port)[-a-z0-9/_.:]+$",
+            r"^[a-z]+-\d+/\d+/\d+$",
+            r"^\d+/\d+/\d+$",
+            r"^qsfp\s*\d+$",
+            r"^sfp\s*\d+$",
+        )
+
+        return any(re.match(pattern, token) for pattern in interface_patterns)
+
+    @staticmethod
+    def looks_like_slot_or_port_index(value: str) -> bool:
+        token = (value or "").strip().lower()
+
+        if not token:
+            return False
+
+        if re.match(r"^\d+$", token):
+            return True
+
+        if re.match(r"^(slot|module|lc|mic|mpa|pic)\s*\d+$", token):
+            return True
+
+        return False
+
+    def find_mounted_device_by_identifier_token(
+        self,
+        token: str,
+        matched_racks: List[Rack],
+    ) -> Optional[Device]:
+        normalized_token = self.normalize_pm_match_text(token)
+
+        if not normalized_token:
+            return None
+
+        candidate_devices: List[Device] = []
+
+        for device in Device.objects.filter(position__isnull=False).exclude(name=""):
+            normalized_device_name = self.normalize_pm_match_text(device.name)
+            if normalized_device_name == normalized_token:
+                candidate_devices.append(device)
+
+        if not candidate_devices:
+            return None
+
+        matched_rack_ids = {rack.pk for rack in matched_racks}
+        if matched_rack_ids:
+            rack_scoped_candidates = [
+                device for device in candidate_devices if device.rack_id in matched_rack_ids
+            ]
+            if rack_scoped_candidates:
+                candidate_devices = rack_scoped_candidates
+
+        candidate_devices.sort(key=lambda device: len(device.name), reverse=True)
+        return candidate_devices[0]
 
     def find_device_by_rack_scoped_contains(
         self,
