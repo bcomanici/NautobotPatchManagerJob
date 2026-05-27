@@ -2545,6 +2545,12 @@ class PatchManagerImport(Job):
     def canonicalize_virtual_rack_bucket(self, cleaned_parts: List[str]) -> str:
         """
         Collapse similar virtual rack location strings into one canonical bucket.
+
+        New rule:
+        - If a suite number exists, the suite is the rack bucket.
+          Provider/panel/MMR strings are not part of the virtual rack name.
+        - If no suite exists, keep stable room/cage/DC context.
+        - Provider/panel names belong on passive devices/comments, not rack names.
         """
         if not cleaned_parts:
             return ""
@@ -2553,45 +2559,54 @@ class PatchManagerImport(Job):
         joined_norm = self.normalize_pm_match_text(joined)
 
         suite = self.extract_suite_token(joined)
-        has_mmr = bool(re.search(r"\b(mmr|meet\s+me\s+room)\b", joined, re.IGNORECASE))
-        has_crown_castle = "crown castle" in joined_norm
-        has_drt = "drt" in joined_norm
-        has_non_nysernet_panels = "non nysernet panel" in joined_norm
+        if suite:
+            return suite
+
         has_nysernet_cage = "nysernet cage" in joined_norm or "nysenet cage" in joined_norm
+        has_mmr = bool(re.search(r"\b(mmr|meet\s+me\s+room)\b", joined, re.IGNORECASE))
         dc_match = re.search(r"\bdc\s+(north|south|east|west)\b", joined, re.IGNORECASE)
 
-        if suite:
-            pieces = [suite]
-
-            if has_crown_castle:
-                pieces.append("Crown Castle")
-
-            if has_mmr or has_drt:
-                pieces.append("MMR")
-
-            if has_non_nysernet_panels:
-                pieces.append("Non NYSERNet Panels")
-
-            return " ".join(pieces)
-
         if has_nysernet_cage:
-            if has_non_nysernet_panels:
-                return "NYSERNet Cage Non NYSERNet Panels"
             return "NYSERNet Cage"
+
+        if has_mmr:
+            return "MMR"
 
         if dc_match:
             return f"DC {dc_match.group(1).capitalize()}"
 
-        # Known room/location buckets.
         for cleaned in cleaned_parts:
             normalized = self.normalize_pm_match_text(cleaned)
+
             if "telco room" in normalized:
                 return "Telco Room"
-            if "meet me room" in normalized or normalized == "mmr":
-                return "MMR"
+
             if "danc" in normalized:
                 return "DANC"
-            if "centurylink" in normalized:
+
+        # Last resort: use the first useful non-provider/non-panel location
+        # context. Avoid creating separate virtual racks only because the
+        # provider or panel owner changed.
+        provider_or_panel_terms = (
+            "crown castle",
+            "centurylink",
+            "non nysernet panel",
+            "panel",
+            "panels",
+            "fdp",
+            "fiber",
+            "bulkhead",
+            "commscope",
+            "telect",
+        )
+
+        for cleaned in cleaned_parts:
+            normalized = self.normalize_pm_match_text(cleaned)
+
+            if any(term in normalized for term in provider_or_panel_terms):
+                continue
+
+            if cleaned:
                 return cleaned
 
         return ""
