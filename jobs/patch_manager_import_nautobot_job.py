@@ -54,6 +54,8 @@ DEFAULT_MANUFACTURER_NAME = "Patch Manager"
 DEFAULT_LOCATION_TYPE_NAME = "Site"
 DEFAULT_STATUS_NAME = "Active"
 DEFAULT_DEVICE_ROLE_NAME = "Patch Manager Imported"
+DEFAULT_PASSIVE_ROLE_NAME = "Patch Manager Passive Infrastructure"
+DEFAULT_PASSIVE_MANUFACTURER_NAME = "Generic"
 DEFAULT_RACK_HEIGHT = 42
 
 RACK_LOOKUP_KEYWORDS = (
@@ -719,6 +721,9 @@ class PatchManagerImport(Job):
             )
 
             if not target_device:
+                target_device = self.get_or_create_passive_infrastructure_device_for_row(row)
+
+            if not target_device:
                 self.mark_no_valid_u_outcome(row, "no_matching_parent")
                 self.logger.info(
                     "Skipping port detail row; could not find imported parent device from Equipment Identifier: %s",
@@ -744,6 +749,154 @@ class PatchManagerImport(Job):
             device.comments = self.replace_pm_port_details_block(device.comments or "", detail_rows)
             device.validated_save()
             self.logger.info("Updated Patch Manager port details on device %s", device.name)
+
+    def get_or_create_passive_infrastructure_device_for_row(
+        self,
+        row: Dict[str, Any],
+    ) -> Optional[Device]:
+        identifier = self.clean(row.get(self.fields["device_identifier"]))
+        if not identifier:
+            return None
+
+        identifier_data = self.parse_equipment_identifier(identifier)
+        identifier_parts = identifier_data.get("identifier_parts", [])
+
+        bucket_type = self.detect_passive_infrastructure_bucket(identifier_parts)
+        if not bucket_type:
+            return None
+
+        location = self.get_or_create_location(
+            identifier_data.get("location") or "Patch Manager",
+            identifier_data.get("address") or "",
+        )
+
+        rack = self.find_rack_from_names(identifier_parts, location)
+        if not rack:
+            return None
+
+        device_name = f"{rack.name} {bucket_type}"
+        device_type = self.get_or_create_passive_device_type(bucket_type)
+        role = self.get_or_create_device_role(DEFAULT_PASSIVE_ROLE_NAME)
+        status = self.get_status()
+
+        existing_device = Device.objects.filter(name=device_name).first()
+        position = existing_device.position if existing_device else self.find_highest_available_rack_u(rack)
+        face = existing_device.face if existing_device else "front"
+
+        defaults = {
+            "device_type": device_type,
+            "role": role,
+            "status": status,
+            "location": rack.location,
+            "rack": rack,
+            "position": position,
+            "face": face or "front",
+            "comments": f"Passive infrastructure bucket created by Patch Manager import: {bucket_type}",
+        }
+
+        if position is None:
+            defaults["rack"] = rack
+            defaults["position"] = None
+            defaults["face"] = ""
+
+        try:
+            device, created = Device.objects.update_or_create(
+                name=device_name,
+                defaults=defaults,
+            )
+        except ValidationError as exc:
+            self.logger.warning(
+                "Passive infrastructure device placement failed for %s in rack=%s position=%s: %s. "
+                "Retrying without rack position.",
+                device_name,
+                rack.name,
+                position,
+                exc,
+            )
+            defaults["position"] = None
+            defaults["face"] = ""
+            device, created = Device.objects.update_or_create(
+                name=device_name,
+                defaults=defaults,
+            )
+
+        self.logger.info(
+            "%s passive infrastructure device %s in rack %s",
+            "Created" if created else "Updated",
+            device.name,
+            rack.name,
+        )
+
+        return device
+
+    def detect_passive_infrastructure_bucket(self, identifier_parts: List[str]) -> str:
+        for part in identifier_parts:
+            bucket = self.normalize_passive_infrastructure_bucket(part)
+            if bucket:
+                return bucket
+
+        return ""
+
+    @staticmethod
+    def normalize_passive_infrastructure_bucket(value: str) -> str:
+        text = re.sub(r"\s+", " ", (value or "").replace("<COMMA>", ",").strip())
+        normalized = text.lower()
+
+        if not normalized:
+            return ""
+
+        if "crown castle fdp" in normalized:
+            return "Crown Castle FDP"
+
+        if "fdp" in normalized:
+            return text
+
+        if "non nysernet panel" in normalized:
+            return "Non NYSERNet Panels"
+
+        if "fiber management" in normalized:
+            return "Fiber Management"
+
+        if "bulkhead connector" in normalized:
+            return "Bulkhead Connector"
+
+        if "commscope fpx" in normalized or normalized.startswith("commscope fpx"):
+            return "CommScope FPX"
+
+        if "telect" in normalized:
+            return "Telect"
+
+        if "patch panel" in normalized:
+            return "Patch Panel"
+
+        return ""
+
+    def get_or_create_passive_device_type(self, bucket_type: str) -> DeviceType:
+        manufacturer, _ = Manufacturer.objects.get_or_create(name=DEFAULT_PASSIVE_MANUFACTURER_NAME)
+
+        device_type, _ = DeviceType.objects.get_or_create(
+            manufacturer=manufacturer,
+            model=bucket_type,
+        )
+
+        return device_type
+
+    def find_highest_available_rack_u(self, rack: Rack) -> Optional[int]:
+        used_positions = set(
+            Device.objects.filter(rack=rack)
+            .exclude(position__isnull=True)
+            .values_list("position", flat=True)
+        )
+
+        for position in range(rack.u_height, 0, -1):
+            if position not in used_positions:
+                return position
+
+        self.logger.warning(
+            "No available U positions found in rack %s for passive infrastructure device",
+            rack.name,
+        )
+        return None
 
     def find_imported_device_in_identifier(self, value: str) -> Optional[Device]:
         """
