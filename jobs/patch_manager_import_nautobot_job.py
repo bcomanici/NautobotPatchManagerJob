@@ -2152,6 +2152,7 @@ class PatchManagerImport(Job):
 
         return tokens
 
+    @staticmethod
     def extract_rack_number_tokens(value: str) -> set:
         tokens = set()
 
