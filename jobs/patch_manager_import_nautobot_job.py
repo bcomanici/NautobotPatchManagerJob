@@ -62,7 +62,6 @@ RACK_LOOKUP_KEYWORDS = (
     "cage",
     "panel",
     "panels",
-    "netflix",
 )
 
 IGNORED_RACK_LOOKUP_TOKENS = {
@@ -301,52 +300,113 @@ class PatchManagerImport(Job):
 
     def build_rack_name(self, name: str, identifier: str) -> str:
         """
-        Build a stable Nautobot rack name from Patch Manager identifiers.
+        Build a stable, location-qualified Nautobot rack name from Patch Manager
+        cabinet identifiers.
 
-        Examples:
-        - "Rack 101.02 Panel 2" -> "Syracuse POP Rack 101.2"
-        - "2405.15 NYSERNet - 55a1<COMMA> SAN. Netflix"
-          -> "2405.15 NYSERNet - 55a1, SAN. Netflix"
+        This prevents generic Patch Manager cabinet names like "Rack" or
+        "Rack 45Ux19x40 Plan 22x8" from collapsing into duplicate Nautobot rack
+        names across different locations.
         """
         clean_name = self.clean(name)
         clean_identifier = self.clean(identifier)
 
-        if not clean_name.lower().startswith("rack") or not clean_identifier:
+        if not clean_identifier:
             return clean_name
 
-        parts = [
-            part.strip().replace("<COMMA>", ",")
-            for part in clean_identifier.split(",")
-            if part.strip()
-        ]
+        parts = self.split_identifier_preserving_escaped_commas(clean_identifier)
+        if not parts:
+            return clean_name
 
-        site_name = parts[0] if parts else ""
+        if not self.is_generic_patch_manager_rack_name(clean_name):
+            return clean_name.replace("<COMMA>", ",")
 
-        for part in reversed(parts):
-            # Preserve explicit named rack identifiers first.
-            if re.search(r"\d+\.\d+", part):
-                normalized_part = re.sub(
-                    r"\bpanel\s+\d+\b",
-                    "",
-                    part,
-                    flags=re.IGNORECASE,
-                ).strip()
+        site_name = parts[0]
+        hierarchy_parts = parts[3:] if len(parts) > 3 else parts[1:]
+        meaningful_part = self.find_meaningful_rack_identifier_part(hierarchy_parts)
 
-                normalized_part = re.sub(r"\s+", " ", normalized_part)
+        if meaningful_part:
+            normalized_part = self.normalize_imported_rack_name_part(meaningful_part)
 
-                # Normalize 101.02 -> 101.2
-                normalized_part = re.sub(
-                    r"(\d+)\.0+(\d+)",
-                    lambda m: f"{m.group(1)}.{int(m.group(2))}",
-                    normalized_part,
-                )
-
-                if site_name and "rack" not in normalized_part.lower():
-                    return f"{site_name} {normalized_part}"
-
+            if re.match(r"^\d+\.\d+\b", normalized_part):
                 return normalized_part
 
-        return clean_name
+            if normalized_part.lower().startswith("rack "):
+                return f"{site_name} {normalized_part}"
+
+            if site_name.lower() not in normalized_part.lower():
+                return f"{site_name} {normalized_part}"
+
+            return normalized_part
+
+        leaf_parts = [
+            part for part in reversed(hierarchy_parts)
+            if self.normalize_pm_match_text(part) not in IGNORED_RACK_LOOKUP_TOKENS
+        ]
+
+        if leaf_parts:
+            leaf = self.normalize_imported_rack_name_part(leaf_parts[0])
+            if leaf and leaf.lower() != site_name.lower():
+                return f"{site_name} {leaf} {clean_name}".strip()
+
+        return f"{site_name} {clean_name}".strip()
+
+    @staticmethod
+    def split_identifier_preserving_escaped_commas(identifier: str) -> List[str]:
+        placeholder = "__PM_ESCAPED_COMMA__"
+        protected = (identifier or "").replace("<COMMA>", placeholder)
+        parts = [part.strip().replace(placeholder, ",") for part in protected.split(",") if part.strip()]
+        return parts
+
+    @staticmethod
+    def is_generic_patch_manager_rack_name(name: str) -> bool:
+        normalized = re.sub(r"\s+", " ", name or "").strip().lower()
+        return not normalized or normalized == "rack" or normalized.startswith("rack ")
+
+    def find_meaningful_rack_identifier_part(self, parts: List[str]) -> str:
+        ignored = set(IGNORED_RACK_LOOKUP_TOKENS) | {
+            "nysernet cage",
+            "nysenet cage",
+        }
+
+        for part in reversed(parts):
+            normalized = self.normalize_pm_match_text(part)
+            if normalized in ignored:
+                continue
+            if re.search(r"\brack\s+\d+\.\d+\b", normalized):
+                return part
+
+        for part in reversed(parts):
+            normalized = self.normalize_pm_match_text(part)
+            if normalized in ignored:
+                continue
+            if re.search(r"^\d+\.\d+\b", normalized):
+                return part
+
+        for part in reversed(parts):
+            normalized = self.normalize_pm_match_text(part)
+            if normalized in ignored:
+                continue
+            if any(keyword in normalized for keyword in ("fdp", "panel", "panels", "cage")):
+                return part
+
+        for part in reversed(parts):
+            normalized = self.normalize_pm_match_text(part)
+            if normalized and normalized not in ignored:
+                return part
+
+        return ""
+
+    @staticmethod
+    def normalize_imported_rack_name_part(value: str) -> str:
+        normalized = (value or "").replace("<COMMA>", ",").strip()
+        normalized = re.sub(r"\bpanel\s+\d+\b", "", normalized, flags=re.IGNORECASE).strip()
+        normalized = re.sub(r"\s+", " ", normalized)
+        normalized = re.sub(
+            r"(\d+)\.0+(\d+)",
+            lambda match: f"{match.group(1)}.{int(match.group(2))}",
+            normalized,
+        )
+        return normalized
 
     def import_racks(self, rows: Iterable[Dict[str, Any]]) -> None:
         status = self.get_status()
@@ -1227,13 +1287,13 @@ class PatchManagerImport(Job):
         location: Optional[Location] = None,
     ) -> Optional[Rack]:
         """
-        Create a virtual rack only for Patch Manager infrastructure buckets that
-        are not real rack names in Nautobot, such as FDPs, cages, or third-party
-        panel groups.
+        Create a virtual rack only for unresolved non-rack infrastructure buckets.
 
-        Example:
-        ["Syracuse POP", "Syracuse", "401 North Broad Street", "Crown Castle FDP", "syr-ISP-540"]
-        -> Rack name: "Syracuse POP Crown Castle FDP"
+        This deliberately does NOT create virtual racks from:
+        - generic location hierarchy tokens
+        - actual rack-looking strings
+        - customer/descriptor tokens such as Netflix
+        - device names
         """
         if not identifier_parts:
             return None
@@ -1242,15 +1302,20 @@ class PatchManagerImport(Job):
         if not parts:
             return None
 
+        # If a real rack-looking value exists anywhere in the identifier, do not
+        # create a virtual rack. The real rack normalizer should handle it.
+        for part in parts:
+            if self.looks_like_real_rack_reference(part):
+                return None
+
         virtual_part = self.find_virtual_rack_part(parts)
         if not virtual_part:
             return None
 
         site_name = parts[0]
-        virtual_rack_name = re.sub(r"\s+", " ", f"{site_name} {virtual_part}").strip()
+        virtual_rack_name = self.normalize_virtual_rack_name(site_name, virtual_part)
 
-        # Guard against creating vague or duplicate-looking racks.
-        if not virtual_rack_name or virtual_rack_name.lower().startswith("rack "):
+        if not virtual_rack_name:
             return None
 
         rack_location = location or self.get_or_create_location(site_name)
@@ -1277,29 +1342,62 @@ class PatchManagerImport(Job):
         return rack
 
     @staticmethod
+    def normalize_virtual_rack_name(site_name: str, virtual_part: str) -> str:
+        site = re.sub(r"\s+", " ", (site_name or "").strip())
+        bucket = re.sub(r"\s+", " ", (virtual_part or "").strip())
+
+        if not site or not bucket:
+            return ""
+
+        if bucket.lower().startswith(site.lower()):
+            return bucket
+
+        return f"{site} {bucket}"
+
+    @staticmethod
+    def looks_like_real_rack_reference(value: str) -> bool:
+        normalized = re.sub(r"\s+", " ", (value or "").replace("<COMMA>", ",").strip().lower())
+
+        if not normalized:
+            return False
+
+        if re.search(r"\brack\s+\d+\.\d+\b", normalized):
+            return True
+
+        if re.search(r"^\d+\.\d+\b", normalized):
+            return True
+
+        return False
+
+    @staticmethod
     def find_virtual_rack_part(parts: List[str]) -> str:
         """
-        Return only non-rack infrastructure buckets for virtual-rack creation.
-
-        Do not create virtual racks from strings that contain "rack"; those
-        should either resolve to an existing real rack or remain reported as
-        no-rack so we can correct the rack normalizer.
+        Pick only true infrastructure bucket tokens for virtual rack creation.
         """
         virtual_keywords = (
             "fdp",
-            "cage",
             "panel",
             "panels",
-            "netflix",
+            "cage",
         )
+
+        ignored_exact = set(IGNORED_RACK_LOOKUP_TOKENS) | {
+            "nysernet cage",
+            "nysenet cage",
+            "netflix",
+            "san. netflix",
+        }
 
         for part in parts[3:]:
             normalized = re.sub(r"\s+", " ", part.strip().lower())
 
-            if not normalized or normalized in IGNORED_RACK_LOOKUP_TOKENS:
+            if not normalized or normalized in ignored_exact:
                 continue
 
             if "rack" in normalized:
+                continue
+
+            if re.search(r"\b[a-z]{2,10}[a-z0-9]*-[a-z0-9][a-z0-9-]*\b", normalized):
                 continue
 
             if any(keyword in normalized for keyword in virtual_keywords):
