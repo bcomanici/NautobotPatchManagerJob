@@ -223,6 +223,55 @@ class PatchManagerImport(Job):
                 item["equipment_identifier"],
             )
 
+    def build_rack_name(self, name: str, identifier: str) -> str:
+        """
+        Build a stable Nautobot rack name from Patch Manager identifiers.
+
+        Examples:
+        - "Rack 101.02 Panel 2" -> "Syracuse POP Rack 101.2"
+        - "2405.15 NYSERNet - 55a1<COMMA> SAN. Netflix"
+          -> "2405.15 NYSERNet - 55a1, SAN. Netflix"
+        """
+        clean_name = self.clean(name)
+        clean_identifier = self.clean(identifier)
+
+        if not clean_name.lower().startswith("rack") or not clean_identifier:
+            return clean_name
+
+        parts = [
+            part.strip().replace("<COMMA>", ",")
+            for part in clean_identifier.split(",")
+            if part.strip()
+        ]
+
+        site_name = parts[0] if parts else ""
+
+        for part in reversed(parts):
+            # Preserve explicit named rack identifiers first.
+            if re.search(r"\d+\.\d+", part):
+                normalized_part = re.sub(
+                    r"\bpanel\s+\d+\b",
+                    "",
+                    part,
+                    flags=re.IGNORECASE,
+                ).strip()
+
+                normalized_part = re.sub(r"\s+", " ", normalized_part)
+
+                # Normalize 101.02 -> 101.2
+                normalized_part = re.sub(
+                    r"(\d+)\.0+(\d+)",
+                    lambda m: f"{m.group(1)}.{int(m.group(2))}",
+                    normalized_part,
+                )
+
+                if site_name and "rack" not in normalized_part.lower():
+                    return f"{site_name} {normalized_part}"
+
+                return normalized_part
+
+        return clean_name
+
     def import_racks(self, rows: Iterable[Dict[str, Any]]) -> None:
         status = self.get_status()
 
@@ -235,10 +284,7 @@ class PatchManagerImport(Job):
                 self.logger.warning("Skipping rack without name: %s", row)
                 continue
 
-            if name.lower().startswith("rack") and identifier:
-                identifier_parts = [p.strip() for p in identifier.split(",") if p.strip()]
-                if len(identifier_parts) > 1:
-                    name = f"{identifier_parts[1]} {name}"
+            name = self.build_rack_name(name, identifier)
 
             u_height = self.parse_rack_height(rack_template)
             location_name = self.clean(row.get(self.fields["rack_location"])) or "Patch Manager"
@@ -1047,15 +1093,61 @@ class PatchManagerImport(Job):
         role.content_types.add(ContentType.objects.get_for_model(Device))
 
     def get_or_create_device_type(self, name: str) -> DeviceType:
-        clean_name = name or "Unknown Patch Manager Equipment"
-        manufacturer, _ = Manufacturer.objects.get_or_create(name=DEFAULT_MANUFACTURER_NAME)
+        clean_name = self.clean(name) or "Unknown Patch Manager Equipment"
+
+        manufacturer_name, model_name = self.parse_manufacturer_and_model(clean_name)
+
+        manufacturer, _ = Manufacturer.objects.get_or_create(
+            name=manufacturer_name
+        )
 
         device_type, _ = DeviceType.objects.get_or_create(
             manufacturer=manufacturer,
-            model=clean_name,
+            model=model_name,
         )
 
         return device_type
+
+    def parse_manufacturer_and_model(self, value: str) -> Tuple[str, str]:
+        """
+        Parse Patch Manager equipment templates into Nautobot manufacturer/model.
+
+        Examples:
+        - "Cisco NX540" -> ("Cisco", "NX540")
+        - "Juniper MX960" -> ("Juniper", "MX960")
+        - "Ciena 5171" -> ("Ciena", "5171")
+        """
+        clean_value = self.clean(value)
+
+        if not clean_value:
+            return DEFAULT_MANUFACTURER_NAME, "Unknown"
+
+        known_manufacturers = {
+            "Cisco",
+            "Juniper",
+            "Ciena",
+            "Arista",
+            "Nokia",
+            "Adtran",
+            "Fujitsu",
+            "Infinera",
+            "Ekinops",
+            "HP",
+            "HPE",
+            "Dell",
+            "Supermicro",
+        }
+
+        for manufacturer in sorted(known_manufacturers, key=len, reverse=True):
+            if clean_value.lower().startswith(manufacturer.lower() + " "):
+                model = clean_value[len(manufacturer):].strip()
+                return manufacturer, model or clean_value
+
+        parts = clean_value.split(None, 1)
+        if len(parts) == 2 and len(parts[0]) > 2:
+            return parts[0], parts[1]
+
+        return DEFAULT_MANUFACTURER_NAME, clean_value
 
     def get_or_create_device_role(self, name: str) -> Role:
         role_name = name or DEFAULT_DEVICE_ROLE_NAME
