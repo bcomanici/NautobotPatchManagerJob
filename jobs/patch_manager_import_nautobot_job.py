@@ -94,6 +94,8 @@ PORT_DETAIL_FIELDS = (
 PM_PORT_DETAILS_START = "## Patch Manager Port Details"
 PM_PORT_DETAILS_END = "## End Patch Manager Port Details"
 
+PM_PORT_DETAILS_NOTE_TITLE = "Patch Manager Port Details"
+
 CONNECTION_SPLIT_RE = re.compile(r"\s*\|\s*|\s*;\s*")
 PM_TEMPLATE_BRACKET_RE = re.compile(r"\[[^\]]+\]")
 
