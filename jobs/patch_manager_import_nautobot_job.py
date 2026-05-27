@@ -300,14 +300,18 @@ class PatchManagerImport(Job):
 
     def build_rack_name(self, name: str, identifier: str) -> str:
         """
-        Build a stable, location-qualified Nautobot rack name from Patch Manager
-        cabinet identifiers.
+        Build a stable, location-qualified Nautobot rack name from the full
+        Patch Manager Cabinet Identifier path.
 
-        This prevents generic Patch Manager cabinet names like "Rack" or
-        "Rack 45Ux19x40 Plan 22x8" from collapsing into duplicate Nautobot rack
-        names across different locations.
+        Rules:
+        - Non-generic cabinet names are preserved, except <COMMA> is unescaped.
+        - Generic/template cabinet names like "Rack" or "Rack 45Ux19x40..." use
+          the Cabinet Identifier for uniqueness.
+        - If the identifier has a precise rack token, use that.
+        - Otherwise use the full location path plus the rack/template name so
+          repeated generic rows do not collapse into the same Nautobot rack.
         """
-        clean_name = self.clean(name)
+        clean_name = self.clean(name).replace("<COMMA>", ",")
         clean_identifier = self.clean(identifier)
 
         if not clean_identifier:
@@ -318,14 +322,14 @@ class PatchManagerImport(Job):
             return clean_name
 
         if not self.is_generic_patch_manager_rack_name(clean_name):
-            return clean_name.replace("<COMMA>", ",")
+            return clean_name
 
-        site_name = parts[0]
+        site_name = self.get_rack_name_prefix_from_identifier(parts)
         hierarchy_parts = parts[3:] if len(parts) > 3 else parts[1:]
-        meaningful_part = self.find_meaningful_rack_identifier_part(hierarchy_parts)
 
-        if meaningful_part:
-            normalized_part = self.normalize_imported_rack_name_part(meaningful_part)
+        precise_part = self.find_precise_rack_identifier_part(hierarchy_parts)
+        if precise_part:
+            normalized_part = self.normalize_imported_rack_name_part(precise_part)
 
             if re.match(r"^\d+\.\d+\b", normalized_part):
                 return normalized_part
@@ -338,17 +342,43 @@ class PatchManagerImport(Job):
 
             return normalized_part
 
-        leaf_parts = [
-            part for part in reversed(hierarchy_parts)
-            if self.normalize_pm_match_text(part) not in IGNORED_RACK_LOOKUP_TOKENS
-        ]
+        hierarchy_name = self.build_location_qualified_rack_name_from_identifier(
+            site_name=site_name,
+            hierarchy_parts=hierarchy_parts,
+            rack_name=clean_name,
+        )
 
-        if leaf_parts:
-            leaf = self.normalize_imported_rack_name_part(leaf_parts[0])
-            if leaf and leaf.lower() != site_name.lower():
-                return f"{site_name} {leaf} {clean_name}".strip()
+        return hierarchy_name or clean_name
 
-        return f"{site_name} {clean_name}".strip()
+    @staticmethod
+    def get_rack_name_prefix_from_identifier(parts: List[str]) -> str:
+        """
+        Choose the best prefix for generic Patch Manager rack names.
+
+        Usually parts[0] is best, e.g. "Syracuse POP" should remain
+        "Syracuse POP Rack 101.2".
+
+        But some parts[0] values are broad organizational buckets, e.g.
+        "NYSERNet Backbone"; for those, parts[1] is the useful site name,
+        e.g. "Batavia Rack 301.10".
+        """
+        if not parts:
+            return ""
+
+        broad_buckets = {
+            "nysernet backbone",
+            "customer locations",
+            "customer location",
+            "colocation",
+            "colo",
+        }
+
+        first = re.sub(r"\s+", " ", parts[0].strip()).lower()
+
+        if first in broad_buckets and len(parts) > 1 and parts[1].strip():
+            return parts[1].strip()
+
+        return parts[0].strip()
 
     @staticmethod
     def split_identifier_preserving_escaped_commas(identifier: str) -> List[str]:
@@ -362,7 +392,7 @@ class PatchManagerImport(Job):
         normalized = re.sub(r"\s+", " ", name or "").strip().lower()
         return not normalized or normalized == "rack" or normalized.startswith("rack ")
 
-    def find_meaningful_rack_identifier_part(self, parts: List[str]) -> str:
+    def find_precise_rack_identifier_part(self, parts: List[str]) -> str:
         ignored = set(IGNORED_RACK_LOOKUP_TOKENS) | {
             "nysernet cage",
             "nysenet cage",
@@ -372,6 +402,7 @@ class PatchManagerImport(Job):
             normalized = self.normalize_pm_match_text(part)
             if normalized in ignored:
                 continue
+
             if re.search(r"\brack\s+\d+\.\d+\b", normalized):
                 return part
 
@@ -379,33 +410,76 @@ class PatchManagerImport(Job):
             normalized = self.normalize_pm_match_text(part)
             if normalized in ignored:
                 continue
+
             if re.search(r"^\d+\.\d+\b", normalized):
-                return part
-
-        for part in reversed(parts):
-            normalized = self.normalize_pm_match_text(part)
-            if normalized in ignored:
-                continue
-            if any(keyword in normalized for keyword in ("fdp", "panel", "panels", "cage")):
-                return part
-
-        for part in reversed(parts):
-            normalized = self.normalize_pm_match_text(part)
-            if normalized and normalized not in ignored:
                 return part
 
         return ""
 
+    def find_meaningful_rack_identifier_part(self, parts: List[str]) -> str:
+        precise = self.find_precise_rack_identifier_part(parts)
+        if precise:
+            return precise
+
+        for part in reversed(parts):
+            normalized = self.normalize_pm_match_text(part)
+            if normalized and normalized not in IGNORED_RACK_LOOKUP_TOKENS:
+                return part
+
+        return ""
+
+    def build_location_qualified_rack_name_from_identifier(
+        self,
+        site_name: str,
+        hierarchy_parts: List[str],
+        rack_name: str,
+    ) -> str:
+        cleaned_parts: List[str] = []
+
+        for part in hierarchy_parts:
+            normalized_part = self.normalize_imported_rack_name_part(part)
+            normalized_key = self.normalize_pm_match_text(normalized_part)
+
+            if not normalized_part or normalized_key in IGNORED_RACK_LOOKUP_TOKENS:
+                continue
+
+            if normalized_key == self.normalize_pm_match_text(site_name):
+                continue
+
+            if re.search(r"\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|broad)", normalized_key):
+                continue
+
+            if normalized_part not in cleaned_parts:
+                cleaned_parts.append(normalized_part)
+
+        pieces = [site_name] + cleaned_parts
+
+        if rack_name and rack_name not in pieces:
+            pieces.append(rack_name)
+
+        result = " ".join(piece for piece in pieces if piece)
+        result = re.sub(r"\s+", " ", result).strip()
+        return result
+
     @staticmethod
     def normalize_imported_rack_name_part(value: str) -> str:
         normalized = (value or "").replace("<COMMA>", ",").strip()
-        normalized = re.sub(r"\bpanel\s+\d+\b", "", normalized, flags=re.IGNORECASE).strip()
+
+        normalized = re.sub(
+            r"\bpanel\s+\d+\b",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        ).strip()
+
         normalized = re.sub(r"\s+", " ", normalized)
+
         normalized = re.sub(
             r"(\d+)\.0+(\d+)",
             lambda match: f"{match.group(1)}.{int(match.group(2))}",
             normalized,
         )
+
         return normalized
 
     def import_racks(self, rows: Iterable[Dict[str, Any]]) -> None:
@@ -439,10 +513,11 @@ class PatchManagerImport(Job):
             self.add_rack_to_lookup_cache(rack)
 
             self.logger.info(
-                "%s rack %s (%sU)",
+                "%s rack %s (%sU) from Cabinet Identifier=%r",
                 "Created" if created else "Updated",
                 rack.name,
                 rack.u_height,
+                identifier,
             )
 
     def import_devices(self, rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
