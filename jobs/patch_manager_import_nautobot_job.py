@@ -746,8 +746,13 @@ class PatchManagerImport(Job):
 
         for device_id, detail_rows in details_by_device_id.items():
             device = Device.objects.get(pk=device_id)
-            device.comments = self.replace_pm_port_details_block(device.comments or "", detail_rows)
-            device.validated_save()
+            updated_comments = self.replace_pm_port_details_block(device.comments or "", detail_rows)
+
+            # This pass only updates comments. Use a direct column update so an
+            # existing device with a rack-placement issue does not fail the
+            # whole sync when Nautobot revalidates rack occupancy.
+            Device.objects.filter(pk=device.pk).update(comments=updated_comments)
+
             self.logger.info("Updated Patch Manager port details on device %s", device.name)
 
     def get_or_create_passive_infrastructure_device_for_row(
