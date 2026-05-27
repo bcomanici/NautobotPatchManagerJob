@@ -854,29 +854,85 @@ class PatchManagerImport(Job):
         """
         Parse Patch Manager child/interface identifiers.
 
-        Common pattern:
+        Common patterns:
             ..., <parent-device>, <slot-or-port-index>, <interface-name>
+            ..., <parent-device>, <interface-name>
 
-        Example:
+        Examples:
             ..., pts-5110, 1, xe-0/0/1
+            ..., router01, xe-0/0/1
+            ..., switch01, QSFP 0
         """
-        if len(identifier_parts) < 3:
+        if len(identifier_parts) < 2:
             return None
+
+        if len(identifier_parts) >= 3:
+            interface_token = identifier_parts[-1]
+            slot_token = identifier_parts[-2]
+            parent_token = identifier_parts[-3]
+
+            if self.looks_like_interface_token(interface_token) and self.looks_like_slot_or_port_index(slot_token):
+                return {
+                    "parent_device": parent_token,
+                    "interface_name": self.normalize_interface_name(interface_token),
+                }
 
         interface_token = identifier_parts[-1]
-        slot_token = identifier_parts[-2]
-        parent_token = identifier_parts[-3]
+        parent_token = identifier_parts[-2]
 
-        if not self.looks_like_interface_token(interface_token):
-            return None
+        if self.looks_like_interface_token(interface_token):
+            return {
+                "parent_device": parent_token,
+                "interface_name": self.normalize_interface_name(interface_token),
+            }
 
-        if not self.looks_like_slot_or_port_index(slot_token):
-            return None
+        return None
 
-        return {
-            "parent_device": parent_token,
-            "interface_name": interface_token.strip(),
-        }
+    @staticmethod
+    def normalize_interface_name(value: str) -> str:
+        return re.sub(r"\s+", " ", (value or "").strip())
+
+    @staticmethod
+    def looks_like_interface_token(value: str) -> bool:
+        token = re.sub(r"\s+", " ", (value or "").strip().lower())
+
+        if not token:
+            return False
+
+        interface_patterns = (
+            r"^(xe|ge|et|fe|te|gi|fo|hundredgige|tengige|ethernet|eth|mgmt)[-a-z0-9/_.:]+$",
+            r"^[a-z]+-\d+/\d+/\d+$",
+            r"^\d+/\d+/\d+$",
+            r"^\d+/\d+$",
+            r"^(qsfp|sfp|cfp|xfp)\s*-?\s*\d+$",
+            r"^(qsfp|sfp|cfp|xfp)\d+$",
+        )
+
+        if any(re.match(pattern, token) for pattern in interface_patterns):
+            return True
+
+        if "/" in token and re.search(r"\d+/\d+", token):
+            return True
+
+        if re.match(r"^(qsfp|sfp|cfp|xfp)", token):
+            return True
+
+        return False
+
+    @staticmethod
+    def looks_like_slot_or_port_index(value: str) -> bool:
+        token = re.sub(r"\s+", " ", (value or "").strip().lower())
+
+        if not token:
+            return False
+
+        if re.match(r"^\d+$", token):
+            return True
+
+        if re.match(r"^(slot|module|lc|mic|mpa|pic)\s*-?\s*\d+$", token):
+            return True
+
+        return False
 
     def get_or_create_passive_infrastructure_device_for_row(
         self,
@@ -1201,38 +1257,6 @@ class PatchManagerImport(Job):
             token=parent_token,
             matched_racks=matched_racks,
         )
-
-    @staticmethod
-    def looks_like_interface_token(value: str) -> bool:
-        token = (value or "").strip().lower()
-
-        if not token:
-            return False
-
-        interface_patterns = (
-            r"^(xe|ge|et|fe|te|gi|fo|hundredgige|tengige|ethernet|eth|mgmt|port)[-a-z0-9/_.:]+$",
-            r"^[a-z]+-\d+/\d+/\d+$",
-            r"^\d+/\d+/\d+$",
-            r"^qsfp\s*\d+$",
-            r"^sfp\s*\d+$",
-        )
-
-        return any(re.match(pattern, token) for pattern in interface_patterns)
-
-    @staticmethod
-    def looks_like_slot_or_port_index(value: str) -> bool:
-        token = (value or "").strip().lower()
-
-        if not token:
-            return False
-
-        if re.match(r"^\d+$", token):
-            return True
-
-        if re.match(r"^(slot|module|lc|mic|mpa|pic)\s*\d+$", token):
-            return True
-
-        return False
 
     def find_mounted_device_by_identifier_token(
         self,
