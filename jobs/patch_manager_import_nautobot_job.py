@@ -1998,20 +1998,28 @@ class PatchManagerImport(Job):
         return any(keyword in normalized for keyword in RACK_LOOKUP_KEYWORDS)
 
     def find_rack(self, value: str) -> Optional[Rack]:
+        candidates = self.find_rack_candidates(value)
+        return candidates[0] if candidates else None
+
+    def find_rack_candidates(self, value: str) -> List[Rack]:
         if not value or not self.should_attempt_rack_lookup(value):
-            return None
+            return []
 
         self.load_rack_lookup_cache()
         candidates = self.get_rack_lookup_candidates(value)
+        matches: List[Rack] = []
 
         for candidate in candidates:
             normalized_candidate = self.normalize_pm_match_text(candidate)
             candidate_keys = self.extract_rack_lookup_keys(normalized_candidate)
 
             for key in candidate_keys:
-                cached_matches = self.rack_lookup_cache.get(key, [])
-                if cached_matches:
-                    return cached_matches[0]
+                for rack in self.rack_lookup_cache.get(key, []):
+                    if rack not in matches:
+                        matches.append(rack)
+
+        if matches:
+            return matches
 
         normalized_candidates = {
             self.normalize_pm_match_text(candidate)
@@ -2019,8 +2027,6 @@ class PatchManagerImport(Job):
             if self.normalize_pm_match_text(candidate)
         }
 
-        # Conservative cached fallback: compare only against cached rack entries,
-        # but do not query Rack.objects.all() per token.
         possible_racks: List[Rack] = []
         seen_rack_ids = set()
 
@@ -2048,11 +2054,104 @@ class PatchManagerImport(Job):
                     or normalized_rack_name in normalized_candidate
                     or self.rack_context_overlaps(normalized_candidate, normalized_rack_name)
                 ):
-                    return rack
+                    if rack not in matches:
+                        matches.append(rack)
 
-        return None
+        return matches
+
+    def choose_best_rack_candidate(
+        self,
+        candidates: List[Rack],
+        identifier_parts: List[str],
+    ) -> Optional[Rack]:
+        if not candidates:
+            return None
+
+        context = " ".join(
+            part.replace("<COMMA>", ",")
+            for part in identifier_parts
+            if self.clean(part)
+        )
+
+        normalized_context = self.normalize_pm_match_text(context)
+        context_tokens = self.get_rack_context_tokens(normalized_context)
+
+        scored: List[Tuple[int, int, str, Rack]] = []
+
+        for rack in candidates:
+            rack_name = self.normalize_pm_match_text(rack.name)
+            rack_tokens = self.get_rack_context_tokens(rack_name)
+
+            score = len(context_tokens & rack_tokens) * 10
+
+            # Stronger signal for exact phrase containment.
+            for part in identifier_parts:
+                normalized_part = self.normalize_pm_match_text(part.replace("<COMMA>", ","))
+                if normalized_part and normalized_part in rack_name:
+                    score += 25
+                if normalized_part and rack_name in normalized_part:
+                    score += 25
+
+            # Prefer candidate whose location name appears in the identifier.
+            if getattr(rack, "location", None):
+                location_name = self.normalize_pm_match_text(rack.location.name)
+                if location_name and location_name in normalized_context:
+                    score += 15
+
+            scored.append((score, len(rack.name), rack.name, rack))
+
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+        best_score, _, _, best_rack = scored[0]
+
+        if best_score <= 0:
+            self.logger.info(
+                "Ambiguous rack alias could not be context-scored. candidates=%s identifier_parts=%s",
+                [rack.name for rack in candidates],
+                identifier_parts,
+            )
+            return None
+
+        self.logger.info(
+            "Resolved ambiguous rack alias to %s using identifier context. candidates=%s",
+            best_rack.name,
+            [rack.name for rack in candidates],
+        )
+
+        return best_rack
 
     @staticmethod
+    def get_rack_context_tokens(value: str) -> set:
+        ignored = {
+            "rack",
+            "cabinet",
+            "colo",
+            "pop",
+            "the",
+            "floor",
+            "street",
+            "st",
+            "road",
+            "rd",
+            "avenue",
+            "ave",
+            "court",
+            "ct",
+            "nysernet",
+            "backbone",
+            "customer",
+            "locations",
+            "location",
+        }
+
+        tokens = {
+            token
+            for token in re.split(r"[^a-z0-9]+", value or "")
+            if len(token) >= 3 and token not in ignored
+        }
+
+        return tokens
+
     def extract_rack_number_tokens(value: str) -> set:
         tokens = set()
 
@@ -2127,11 +2226,35 @@ class PatchManagerImport(Job):
         location: Optional[Location] = None,
     ) -> Optional[Rack]:
         for rack_name in rack_names:
-            rack = self.find_rack(rack_name)
+            rack = self.find_rack_with_context(rack_name, rack_names)
             if rack:
                 return rack
 
         return self.get_or_create_virtual_rack_from_identifier_parts(rack_names, location)
+
+    def find_rack_with_context(
+        self,
+        value: str,
+        identifier_parts: List[str],
+    ) -> Optional[Rack]:
+        """
+        Resolve a rack token using all identifier context.
+
+        This handles ambiguous aliases such as "Cabinet 0316" by first finding
+        all rack candidates for that alias, then choosing the candidate whose
+        rack name best overlaps the rest of the identifier path, such as:
+        - Ashburn VA - PoP
+        - Binghamton - PoP
+        - New York City - PoP
+        """
+        candidates = self.find_rack_candidates(value)
+        if not candidates:
+            return None
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        return self.choose_best_rack_candidate(candidates, identifier_parts) or candidates[0]
 
     def get_or_create_virtual_rack_from_identifier_parts(
         self,
