@@ -89,6 +89,13 @@ PORT_DETAIL_FIELDS = (
     "Port Attributes Rear",
 )
 
+SKIPPED_DEVICE_NOTE_FIELDS = (
+    "Component Label",
+    "Equipment Template",
+    "Equipment Identifier",
+    *PORT_DETAIL_FIELDS,
+)
+
 PM_PORT_DETAILS_START = "## Patch Manager Port Details"
 PM_PORT_DETAILS_END = "## End Patch Manager Port Details"
 
@@ -766,7 +773,7 @@ class PatchManagerImport(Job):
                 self.mark_no_valid_u_outcome(row, "no_matching_parent")
                 continue
 
-            details = self.extract_port_detail_fields(row)
+            details = self.extract_skipped_device_note_details(row)
             if not details:
                 self.mark_no_valid_u_outcome(row, "matched_parent_but_empty_details", target_device)
                 continue
@@ -1739,16 +1746,48 @@ class PatchManagerImport(Job):
 
         return details
 
+    def extract_skipped_device_note_details(self, row: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Build the device-level Note payload for skipped/no-valid-U rows.
+
+        These rows often represent modules, FRUs, optics, or generic numeric
+        child labels such as LC0, MIC 1, Fan, Power, 1, 2, or NE. They should
+        enrich the matched parent device Note, not create independent devices
+        or virtual racks.
+        """
+        details = self.extract_port_detail_fields(row)
+
+        component_label = self.clean(row.get(self.fields["device_name"]))
+        equipment_template = self.clean(row.get(self.fields["device_type"]))
+        equipment_identifier = self.clean(row.get(self.fields["device_identifier"]))
+
+        if component_label:
+            details["Component Label"] = component_label
+
+        if equipment_template:
+            details["Equipment Template"] = equipment_template
+
+        if equipment_identifier:
+            details["Equipment Identifier"] = equipment_identifier
+
+        return details
+
     def render_pm_port_details_block(self, detail_rows: List[Dict[str, str]]) -> str:
         lines = [PM_PORT_DETAILS_START]
 
         for index, details in enumerate(detail_rows, start=1):
-            if details.get("Interface"):
+            component_label = details.get("Component Label", "")
+
+            if details.get("Interface") and component_label:
+                lines.append(f"### Interface {details['Interface']} - Component {component_label} - Entry {index}")
+            elif details.get("Interface"):
                 lines.append(f"### Interface {details['Interface']} - Entry {index}")
+            elif component_label:
+                lines.append(f"### Component {component_label} - Entry {index}")
             elif len(detail_rows) > 1:
                 lines.append(f"### Entry {index}")
 
-            for header in PORT_DETAIL_FIELDS:
+            for header in SKIPPED_DEVICE_NOTE_FIELDS:
                 value = details.get(header)
                 if value:
                     lines.extend([f"### {header}", value])
