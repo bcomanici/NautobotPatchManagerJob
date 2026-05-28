@@ -617,25 +617,18 @@ class PatchManagerImport(Job):
             position, face = self.parse_equipment_position(self.clean(row.get(self.fields["device_position"])))
 
             if position is None:
-                self.logger.info(
-                    "Cataloging skipped device %s; no valid U position found in Equipment Position",
-                    name,
-                )
                 self.record_no_valid_u_row(name, row)
                 skipped_port_detail_rows.append(row)
                 continue
 
             if not rack:
                 equipment_identifier = self.clean(row.get(self.fields["device_identifier"]))
-                identifier_debug_parts = identifier_data.get("identifier_parts", [])
                 self.logger.warning(
                     "Device %s has a valid U position but no matching rack; importing without rack position. "
-                    "Equipment Position=%r Equipment Identifier=%r Parsed Identifier Parts=%r Rack Lookup Attempts=%s",
+                    "Equipment Position=%r Equipment Identifier=%r",
                     name,
                     self.clean(row.get(self.fields["device_position"])),
                     equipment_identifier,
-                    identifier_debug_parts,
-                    self.describe_rack_lookup_attempts(identifier_debug_parts),
                 )
                 position = None
                 face = ""
@@ -776,19 +769,11 @@ class PatchManagerImport(Job):
 
             if not target_device:
                 self.mark_no_valid_u_outcome(row, "no_matching_parent")
-                self.logger.info(
-                    "Skipping port detail row; could not find imported parent device from Equipment Identifier: %s",
-                    row.get(self.fields["device_identifier"]),
-                )
                 continue
 
             details = self.extract_port_detail_fields(row)
             if not details:
                 self.mark_no_valid_u_outcome(row, "matched_parent_but_empty_details", target_device)
-                self.logger.info(
-                    "Skipping port detail row for %s; no port detail fields populated",
-                    target_device.name,
-                )
                 continue
 
             self.mark_no_valid_u_outcome(row, "attached_with_port_details", target_device)
@@ -875,12 +860,6 @@ class PatchManagerImport(Job):
             )
 
         if not parent_device:
-            self.logger.info(
-                "Interface row detected but no mounted parent device was found. "
-                "interface=%r identifier=%r",
-                parsed.get("interface_name"),
-                identifier,
-            )
             return None
 
         interface_name = self.safe_interface_name(parsed["interface_name"])
@@ -1407,10 +1386,6 @@ class PatchManagerImport(Job):
             matched_racks=matched_racks,
         )
         if child_parent_match:
-            self.logger.info(
-                "Matched skipped port detail row using child/interface parent inference: %s",
-                child_parent_match.name,
-            )
             return child_parent_match
 
         rack_scoped_match = self.find_device_by_rack_scoped_contains(
@@ -1425,10 +1400,6 @@ class PatchManagerImport(Job):
             matched_racks=matched_racks,
         )
         if fallback_match:
-            self.logger.info(
-                "Matched skipped port detail row using exact mounted device token fallback: %s",
-                fallback_match.name,
-            )
             return fallback_match
 
         return None
@@ -1561,10 +1532,6 @@ class PatchManagerImport(Job):
                 matched_racks=matched_racks,
             )
             if hostname_match:
-                self.logger.info(
-                    "Matched skipped port detail row using hostname-normalized fallback: %s",
-                    hostname_match.name,
-                )
                 return hostname_match
 
             return None
@@ -2222,18 +2189,7 @@ class PatchManagerImport(Job):
         best_score, _, _, best_rack = scored[0]
 
         if best_score <= 0:
-            self.logger.info(
-                "Ambiguous rack alias could not be context-scored. candidates=%s identifier_parts=%s",
-                [rack.name for rack in candidates],
-                identifier_parts,
-            )
             return None
-
-        self.logger.info(
-            "Resolved ambiguous rack alias to %s using identifier context. candidates=%s",
-            best_rack.name,
-            [rack.name for rack in candidates],
-        )
 
         return best_rack
 
@@ -2361,31 +2317,6 @@ class PatchManagerImport(Job):
                 return rack
 
         return self.get_or_create_virtual_rack_from_identifier_parts(rack_names, location)
-
-    def describe_rack_lookup_attempts(self, identifier_parts: List[str]) -> str:
-        descriptions: List[str] = []
-
-        for part in identifier_parts:
-            clean_part = self.clean(part)
-            if not clean_part:
-                continue
-
-            should_attempt = self.should_attempt_rack_lookup(clean_part)
-            candidates = self.get_rack_lookup_candidates(clean_part) if should_attempt else []
-            contextual_candidates = self.get_contextual_rack_lookup_candidates(clean_part, identifier_parts) if should_attempt else []
-            matches = []
-
-            if should_attempt:
-                for rack in self.find_rack_candidates(clean_part):
-                    matches.append(rack.name)
-
-            descriptions.append(
-                f"part={clean_part!r}; should_attempt={should_attempt}; "
-                f"candidates={candidates!r}; contextual_candidates={contextual_candidates!r}; "
-                f"matches={matches!r}"
-            )
-
-        return " | ".join(descriptions)
 
     def find_rack_with_context(
         self,
