@@ -2662,7 +2662,114 @@ class PatchManagerImport(Job):
             if rack:
                 return rack
 
+        rack = self.find_existing_real_rack_for_generic_rack_token(rack_names, location)
+        if rack:
+            return rack
+
         return self.get_or_create_virtual_rack_from_identifier_parts(rack_names, location)
+
+    def find_existing_real_rack_for_generic_rack_token(
+        self,
+        identifier_parts: List[str],
+        location: Optional[Location],
+    ) -> Optional[Rack]:
+        """
+        Resolve regular rackable devices whose PM identifier uses a generic
+        rack token such as "Rack" after rack import already normalized the
+        physical rack to a contextual name like "Stroudsburg PA Rack" or
+        "Cobleskill <EQUALS> SUNY Cobleskill ... Rack".
+
+        This intentionally runs only after exact/contextual rack matching fails,
+        and only when the identifier contains a generic rack token. It prefers
+        non-virtual racks at the already-resolved location and does not create
+        a virtual rack.
+        """
+        if not location:
+            return None
+
+        generic_tokens = [
+            part for part in identifier_parts
+            if self.is_generic_rack_lookup_token(self.normalize_generic_pm_rack_token(part))
+        ]
+        if not generic_tokens:
+            return None
+
+        location_racks = list(Rack.objects.filter(location=location))
+        if not location_racks:
+            return None
+
+        real_racks = [rack for rack in location_racks if not self.is_imported_virtual_rack(rack)]
+        candidate_racks = real_racks or location_racks
+
+        if len(candidate_racks) == 1:
+            self.logger.info(
+                "Resolved generic PM rack token to existing location rack: location=%s rack=%s tokens=%s",
+                location.name,
+                candidate_racks[0].name,
+                generic_tokens,
+            )
+            return candidate_racks[0]
+
+        context = " ".join(
+            part.replace("<COMMA>", ",")
+            for part in identifier_parts
+            if self.clean(part)
+        )
+        normalized_context = self.normalize_pm_match_text(context)
+        context_tokens = self.get_rack_context_tokens(normalized_context)
+
+        scored: List[Tuple[int, int, str, Rack]] = []
+        for rack in candidate_racks:
+            rack_name = self.normalize_pm_match_text(rack.name)
+            rack_tokens = self.get_rack_context_tokens(rack_name)
+            score = len(context_tokens & rack_tokens) * 10
+
+            if self.normalize_pm_match_text(location.name) and self.normalize_pm_match_text(location.name) in rack_name:
+                score += 20
+
+            if rack_name.endswith(" rack"):
+                score += 10
+
+            for part in identifier_parts:
+                normalized_part = self.normalize_pm_match_text(part.replace("<COMMA>", ","))
+                normalized_generic = self.normalize_generic_pm_rack_token(part)
+                if normalized_part and normalized_part in rack_name:
+                    score += 25
+                if normalized_generic and self.normalize_pm_match_text(normalized_generic) in rack_name:
+                    score += 10
+
+            scored.append((score, len(rack.name), rack.name, rack))
+
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        best_score, _, _, best_rack = scored[0]
+
+        if best_score >= 20:
+            self.logger.info(
+                "Resolved generic PM rack token by location context: location=%s rack=%s score=%s tokens=%s",
+                location.name,
+                best_rack.name,
+                best_score,
+                generic_tokens,
+            )
+            return best_rack
+
+        return None
+
+    @staticmethod
+    def normalize_generic_pm_rack_token(value: str) -> str:
+        """
+        Collapse PM rack fragments like "Rack: 0.0 Shelf 1" back to
+        "Rack" so contextual matching can find location-qualified racks.
+        """
+        text = re.sub(r"\s+", " ", (value or "").replace("<COMMA>", ",").strip())
+        if re.match(r"^rack\s*[:;]", text, flags=re.IGNORECASE):
+            return "Rack"
+        return text
+
+    @staticmethod
+    def is_imported_virtual_rack(rack: Rack) -> bool:
+        comments = getattr(rack, "comments", "") or ""
+        return comments.startswith("Virtual rack created by Patch Manager import")
 
     def find_rack_with_context(
         self,
