@@ -2544,13 +2544,19 @@ class PatchManagerImport(Job):
 
     def canonicalize_virtual_rack_bucket(self, cleaned_parts: List[str]) -> str:
         """
-        Collapse similar virtual rack location strings into one canonical bucket.
+        Collapse similar virtual rack location strings into canonical buckets.
 
-        New rule:
-        - If a suite number exists, the suite is the rack bucket.
-          Provider/panel/MMR strings are not part of the virtual rack name.
-        - If no suite exists, keep stable room/cage/DC context.
-        - Provider/panel names belong on passive devices/comments, not rack names.
+        Canonical hierarchy:
+        1. Site/POP
+        2. Suite OR building/location identifier
+        3. Optional stable room type (MMR, Cage, DC North, Telco Room)
+
+        Strip:
+        - provider names
+        - panel/FDP labels
+        - panel numbers
+        - Crown Castle / CenturyLink / Atlantic Metro / NJEdge
+        - Non NYSERNet Panels
         """
         if not cleaned_parts:
             return ""
@@ -2559,13 +2565,18 @@ class PatchManagerImport(Job):
         joined_norm = self.normalize_pm_match_text(joined)
 
         suite = self.extract_suite_token(joined)
+
+        has_mmr = bool(re.search(r"\b(mmr|meet\s+me\s+room)\b", joined, re.IGNORECASE))
+        has_nysernet_cage = "nysernet cage" in joined_norm or "nysenet cage" in joined_norm
+        dc_match = re.search(r"\bdc\s+(north|south|east|west)\b", joined, re.IGNORECASE)
+
+        # OPTION 1:
+        # Collapse provider-specific variants of the same suite.
         if suite:
             return suite
 
-        has_nysernet_cage = "nysernet cage" in joined_norm or "nysenet cage" in joined_norm
-        has_mmr = bool(re.search(r"\b(mmr|meet\s+me\s+room)\b", joined, re.IGNORECASE))
-        dc_match = re.search(r"\bdc\s+(north|south|east|west)\b", joined, re.IGNORECASE)
-
+        # OPTION 2:
+        # Collapse provider/panel/FDP suffix variants into stable room buckets.
         if has_nysernet_cage:
             return "NYSERNet Cage"
 
@@ -2575,27 +2586,42 @@ class PatchManagerImport(Job):
         if dc_match:
             return f"DC {dc_match.group(1).capitalize()}"
 
-        for cleaned in cleaned_parts:
-            normalized = self.normalize_pm_match_text(cleaned)
+        # OPTION 4:
+        # Collapse panel-number variants.
+        #
+        # Example:
+        #   395 Hudson Panel 1
+        #   395 Hudson Panel 2
+        # -> 395 Hudson
+        panel_number_match = re.search(
+            r"(.+?)\s+panel\s+\d+\b",
+            joined,
+            re.IGNORECASE,
+        )
+        if panel_number_match:
+            collapsed = re.sub(r"\s+", " ", panel_number_match.group(1)).strip()
+            if collapsed:
+                return collapsed
 
-            if "telco room" in normalized:
-                return "Telco Room"
+        # Preserve building/street identities (skip previous Option 3 removal).
+        #
+        # Examples:
+        #   NYC Dark Fiber 205 E 42nd
+        #   NYC Dark Fiber 230 West 41st
+        # remain distinct buckets.
 
-            if "danc" in normalized:
-                return "DANC"
+        # Remove provider/FDP/panel-only suffixes from remaining names.
+        normalized_parts: List[str] = []
 
-        # Last resort: use the first useful non-provider/non-panel location
-        # context. Avoid creating separate virtual racks only because the
-        # provider or panel owner changed.
         provider_or_panel_terms = (
             "crown castle",
             "centurylink",
+            "atlantic metro",
+            "njedge",
             "non nysernet panel",
+            "fdp",
             "panel",
             "panels",
-            "fdp",
-            "fiber",
-            "bulkhead",
             "commscope",
             "telect",
         )
@@ -2606,8 +2632,21 @@ class PatchManagerImport(Job):
             if any(term in normalized for term in provider_or_panel_terms):
                 continue
 
-            if cleaned:
-                return cleaned
+            # Remove trailing LGX/FDP identifiers.
+            cleaned = re.sub(
+                r"\b(lgx\d+|fdp\s*[a-z0-9-]*|panel\s*\d+)\b",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+            if cleaned and cleaned not in normalized_parts:
+                normalized_parts.append(cleaned)
+
+        if normalized_parts:
+            return " ".join(normalized_parts).strip()
 
         return ""
 
