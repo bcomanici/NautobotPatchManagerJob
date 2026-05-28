@@ -1294,6 +1294,65 @@ class PatchManagerImport(Job):
         return rack
 
     @staticmethod
+    def extract_cf_rack_coordinate_aliases(value: str) -> List[str]:
+        """
+        Extract normalized aliases for Syracuse data-center CF rack coordinates.
+
+        Patch Manager can represent the same rack coordinate both as:
+            CF03.01.02
+        and:
+            CF.03.01.02
+
+        Return both spellings so rack lookup can bridge imported rack names and
+        passive panel identifiers without fuzzy matching unrelated values.
+        """
+        text = re.sub(r"\s+", " ", (value or "").replace("<COMMA>", ",").strip())
+        if not text:
+            return []
+
+        aliases: List[str] = []
+
+        patterns = (
+            r"\bCF\.?(\d{2})\.(\d{2})\.(\d{2})\b",
+        )
+
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                building, row, rack = match.groups()
+                compact = f"CF{building}.{row}.{rack}"
+                dotted = f"CF.{building}.{row}.{rack}"
+                for alias in (compact, dotted):
+                    if alias not in aliases:
+                        aliases.append(alias)
+
+        return aliases
+
+    @staticmethod
+    def extract_passive_panel_coordinate_tokens(value: str) -> List[str]:
+        """
+        Extract explicit meet-me-room style rack/panel coordinates.
+
+        Examples:
+            02.A1.23
+            02.A1.02.RU41
+
+        These are intentionally narrow so numeric-only labels or ordinary port
+        names do not become racks.
+        """
+        text = re.sub(r"\s+", " ", (value or "").replace("<COMMA>", ",").strip())
+        if not text:
+            return []
+
+        coords: List[str] = []
+
+        for match in re.finditer(r"\b(\d{2}\.[A-Z]\d\.\d{2}(?:\.RU\d+)?)\b", text, flags=re.IGNORECASE):
+            coord = match.group(1).upper()
+            if coord not in coords:
+                coords.append(coord)
+
+        return coords
+
+    @staticmethod
     def extract_passive_panel_explicit_rack_aliases(value: str) -> List[str]:
         """
         Extract safe rack aliases from explicit passive-panel labels.
