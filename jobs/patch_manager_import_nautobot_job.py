@@ -1319,6 +1319,18 @@ class PatchManagerImport(Job):
                 if alias not in aliases:
                     aliases.append(alias)
 
+        # Some Patch Manager passive rows use a site-generic rack token with
+        # details after punctuation, for example:
+        #   Rack: 0.0 Shelf 1
+        #   Rack: 0.1 FDP-2 / MP128 South
+        # During rack import these normalize to the location-qualified rack
+        # name, such as "Stroudsburg PA Rack". Return the generic "Rack"
+        # alias so find_rack_with_context() can build the same contextual
+        # candidate from the identifier prefix.
+        if re.match(r"^rack\s*[:;]", text, flags=re.IGNORECASE):
+            if "Rack" not in aliases:
+                aliases.append("Rack")
+
         return aliases
 
     def find_existing_rack_by_location_context(
