@@ -2544,19 +2544,27 @@ class PatchManagerImport(Job):
 
     def canonicalize_virtual_rack_bucket(self, cleaned_parts: List[str]) -> str:
         """
-        Collapse similar virtual rack location strings into canonical buckets.
+        Collapse virtual rack location strings into stable location buckets only.
 
-        Canonical hierarchy:
-        1. Site/POP
-        2. Suite OR building/location identifier
-        3. Optional stable room type (MMR, Cage, DC North, Telco Room)
+        The virtual rack name should identify where the passive/fiber grouping
+        lives, not the carrier, panel, FDP, ODP, device, chassis, customer, or
+        circuit/shelf identifier.
 
-        Strip:
+        Keep:
+        - Suite number
+        - MMR / Meet Me Room
+        - NYSERNet Cage
+        - DC North/South/East/West
+        - Telco Room
+        - floor-level location where no better room exists
+        - street/building identity for NYC Dark Fiber FDP sites
+
+        Drop:
         - provider names
-        - panel/FDP labels
-        - panel numbers
-        - Crown Castle / CenturyLink / Atlantic Metro / NJEdge
-        - Non NYSERNet Panels
+        - panel/FDP/ODP/LGX labels
+        - device/chassis names
+        - customer/service names
+        - Ciena/ASR/etc. equipment text
         """
         if not cleaned_parts:
             return ""
@@ -2564,91 +2572,147 @@ class PatchManagerImport(Job):
         joined = " ".join(cleaned_parts)
         joined_norm = self.normalize_pm_match_text(joined)
 
+        # Suite wins and intentionally drops provider/MMR/panel qualifiers.
         suite = self.extract_suite_token(joined)
-
-        has_mmr = bool(re.search(r"\b(mmr|meet\s+me\s+room)\b", joined, re.IGNORECASE))
-        has_nysernet_cage = "nysernet cage" in joined_norm or "nysenet cage" in joined_norm
-        dc_match = re.search(r"\bdc\s+(north|south|east|west)\b", joined, re.IGNORECASE)
-
-        # OPTION 1:
-        # Collapse provider-specific variants of the same suite.
         if suite:
             return suite
 
-        # OPTION 2:
-        # Collapse provider/panel/FDP suffix variants into stable room buckets.
-        if has_nysernet_cage:
+        # Stable room/cage/DC buckets.
+        if "nysernet cage" in joined_norm or "nysenet cage" in joined_norm:
             return "NYSERNet Cage"
 
-        if has_mmr:
-            return "MMR"
-
+        dc_match = re.search(r"\bdc\s+(north|south|east|west)\b", joined, re.IGNORECASE)
         if dc_match:
             return f"DC {dc_match.group(1).capitalize()}"
 
-        # OPTION 4:
-        # Collapse panel-number variants.
-        #
-        # Example:
-        #   395 Hudson Panel 1
-        #   395 Hudson Panel 2
-        # -> 395 Hudson
-        panel_number_match = re.search(
-            r"(.+?)\s+panel\s+\d+\b",
-            joined,
-            re.IGNORECASE,
-        )
-        if panel_number_match:
-            collapsed = re.sub(r"\s+", " ", panel_number_match.group(1)).strip()
-            if collapsed:
-                return collapsed
+        if re.search(r"\b(mmr|meet\s+me\s+room)\b", joined, re.IGNORECASE):
+            return "MMR"
 
-        # Preserve building/street identities (skip previous Option 3 removal).
-        #
+        if "telco room" in joined_norm:
+            return "Telco Room"
+
+        # Preserve a clear floor bucket when no suite/room exists.
+        floor_match = re.search(r"\b(\d+(?:st|nd|rd|th)\s+floor)\b", joined, re.IGNORECASE)
+        if floor_match:
+            return floor_match.group(1).title()
+
+        # Preserve building/street identity for NYC Dark Fiber style FDP sites,
+        # while stripping FDP/panel/LGX/north/south suffixes.
+        dark_fiber_address = self.extract_dark_fiber_address_bucket(joined)
+        if dark_fiber_address:
+            return dark_fiber_address
+
+        # Stable named special areas.
+        if "danc" in joined_norm:
+            return "DANC"
+
+        # Last resort: choose the first stable location-like token and reject
+        # provider/equipment/panel tokens. This prevents names like:
+        #   Virtual ... Coresite St John's ASR 1001x colo
+        #   Virtual ... Windstream DANC Ciena
+        for cleaned in cleaned_parts:
+            cleaned = self.normalize_virtual_rack_part(cleaned)
+            normalized = self.normalize_pm_match_text(cleaned)
+
+            if not cleaned or not normalized:
+                continue
+
+            if self.is_virtual_rack_fragment_noise(normalized):
+                continue
+
+            if self.looks_like_device_or_interface_identifier(cleaned):
+                continue
+
+            if self.looks_like_equipment_specific_virtual_fragment(cleaned):
+                continue
+
+            if self.looks_like_street_address_token(normalized):
+                # Keep only the address itself, not provider/equipment suffixes.
+                return self.clean_address_like_virtual_bucket(cleaned)
+
+            return cleaned
+
+        return ""
+
+    @staticmethod
+    def extract_dark_fiber_address_bucket(value: str) -> str:
+        text = re.sub(r"\s+", " ", value or "").strip()
+
         # Examples:
-        #   NYC Dark Fiber 205 E 42nd
-        #   NYC Dark Fiber 230 West 41st
-        # remain distinct buckets.
+        # - 205 E 42nd FDP north -> 205 E 42nd
+        # - 395 Hudson Panel 1 -> 395 Hudson
+        # - 53rd St Entrance MOMA FDP LGX02 -> 53rd St Entrance MOMA
+        patterns = (
+            r"\b(\d+\s+(?:e|east|w|west)?\s*\d+(?:st|nd|rd|th)?(?:\s+st|\s+street|\s+ave|\s+avenue)?)\b",
+            r"\b(\d+\s+[a-z]+(?:\s+[a-z]+)?)\s+(?:panel|fdp|lgx)\b",
+            r"\b(\d+(?:st|nd|rd|th)\s+st\s+entrance\s+[a-z0-9 ]+?)\s+(?:fdp|lgx|panel)\b",
+        )
 
-        # Remove provider/FDP/panel-only suffixes from remaining names.
-        normalized_parts: List[str] = []
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                bucket = re.sub(r"\s+", " ", match.group(1)).strip()
+                return bucket
 
-        provider_or_panel_terms = (
+        return ""
+
+    @staticmethod
+    def clean_address_like_virtual_bucket(value: str) -> str:
+        cleaned = re.sub(
+            r"\b(panel\s*\d+|fdp\s*(north|south|east|west)?|lgx\d+|odp[.a-z0-9-]*)\b",
+            "",
+            value or "",
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -")
+        return cleaned
+
+    @staticmethod
+    def is_virtual_rack_fragment_noise(normalized: str) -> bool:
+        noise_terms = (
             "crown castle",
             "centurylink",
+            "windstream",
+            "coresite",
             "atlantic metro",
             "njedge",
             "non nysernet panel",
-            "fdp",
             "panel",
             "panels",
+            "fdp",
+            "odp",
+            "lgx",
+            "fiber",
+            "bulkhead",
             "commscope",
             "telect",
+            "ciena",
+            "asr",
+            "st john",
+            "colo",
+            "equipment",
         )
 
-        for cleaned in cleaned_parts:
-            normalized = self.normalize_pm_match_text(cleaned)
+        return any(term in normalized for term in noise_terms)
 
-            if any(term in normalized for term in provider_or_panel_terms):
-                continue
+    @staticmethod
+    def looks_like_equipment_specific_virtual_fragment(value: str) -> bool:
+        token = re.sub(r"\s+", " ", (value or "").strip().lower())
 
-            # Remove trailing LGX/FDP identifiers.
-            cleaned = re.sub(
-                r"\b(lgx\d+|fdp\s*[a-z0-9-]*|panel\s*\d+)\b",
-                "",
-                cleaned,
-                flags=re.IGNORECASE,
-            )
+        if not token:
+            return True
 
-            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        equipment_patterns = (
+            r"\b(asr|ncs|mx|ex|qfx|ciena|adva|ekinops|cisco|juniper)\b",
+            r"\b\d+[a-z]*\s*(?:g|ge|gbe|lr|sr|er|zr)\b",
+            r"\bodp[.a-z0-9-]*\b",
+            r"\blgx\d+\b",
+            r"\bpanel\s*\d+\b",
+            r"\bfdp\b",
+            r"\b[a-z]{2,10}[a-z0-9]*-[a-z0-9][a-z0-9-]*\b",
+        )
 
-            if cleaned and cleaned not in normalized_parts:
-                normalized_parts.append(cleaned)
-
-        if normalized_parts:
-            return " ".join(normalized_parts).strip()
-
-        return ""
+        return any(re.search(pattern, token) for pattern in equipment_patterns)
 
     @staticmethod
     def extract_suite_token(value: str) -> str:
