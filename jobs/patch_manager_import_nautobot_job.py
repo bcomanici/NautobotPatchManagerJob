@@ -1239,6 +1239,89 @@ class PatchManagerImport(Job):
 
         return self.get_or_create_passive_panel_coordinate_rack(identifier_parts, location)
 
+    def get_or_create_passive_panel_coordinate_rack(
+        self,
+        identifier_parts: List[str],
+        location: Optional[Location],
+    ) -> Optional[Rack]:
+        """
+        Create a controlled real rack/container for explicit passive-panel
+        coordinate identifiers that were not present in the Cabinet export.
+
+        This is intentionally narrow and only triggers for meet-me-room style
+        coordinates such as 02.A1.23 or 02.A1.02.RU41. It does not handle
+        numeric-only labels, generic Panel labels, or virtual-rack buckets.
+        """
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+        if not parts:
+            return None
+
+        coordinates: List[str] = []
+        for part in parts:
+            for coordinate in self.extract_passive_panel_coordinate_tokens(part):
+                if coordinate not in coordinates:
+                    coordinates.append(coordinate)
+
+        if not coordinates:
+            return None
+
+        coordinate = coordinates[0]
+
+        # If an imported rack already matches this coordinate after aliases are
+        # expanded, use it instead of creating another rack.
+        lookup_context = list(parts) + [coordinate, f"Rack - {coordinate}"]
+        for alias in (coordinate, f"Rack - {coordinate}"):
+            rack = self.find_rack_with_context(alias, lookup_context)
+            if rack:
+                self.logger.info(
+                    "Resolved passive patch panel coordinate to existing rack: coordinate=%s rack=%s",
+                    coordinate,
+                    rack.name,
+                )
+                return rack
+
+        site_name = self.get_rack_name_prefix_from_identifier(parts)
+        if not site_name:
+            return None
+
+        previous_context = self.get_identifier_token_before_value(coordinate, parts)
+        context_parts = [site_name]
+
+        if previous_context and self.should_use_previous_rack_context(previous_context, site_name):
+            context_parts.append(previous_context)
+
+        context_parts.extend(["Rack", "-", coordinate])
+        rack_name = self.safe_nautobot_name(" ".join(part for part in context_parts if part).replace(" - ", " - "))
+        rack_name = re.sub(r"\s+", " ", rack_name).strip()
+
+        rack_location = location or self.get_or_create_location(site_name)
+        status = self.get_status()
+
+        rack, created = Rack.objects.update_or_create(
+            name=rack_name,
+            location=rack_location,
+            defaults={
+                "status": status,
+                "u_height": DEFAULT_RACK_HEIGHT,
+                "comments": (
+                    "Physical/passive rack container created by Patch Manager import "
+                    "for explicit passive panel coordinate not present in the Cabinet export. "
+                    f"Coordinate: {coordinate}"
+                ),
+            },
+        )
+
+        self.add_rack_to_lookup_cache(rack)
+
+        self.logger.info(
+            "%s passive panel coordinate rack %s for coordinate=%s",
+            "Created" if created else "Updated",
+            rack.name,
+            coordinate,
+        )
+
+        return rack
+
     def find_passive_panel_rack_from_explicit_aliases(
         self,
         identifier_parts: List[str],
