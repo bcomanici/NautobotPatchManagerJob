@@ -446,7 +446,7 @@ class PatchManagerImport(Job):
             if re.search(r"\brack\s+\d+\.\d+\b", normalized):
                 return part
 
-            if re.search(r"\brack\s+[a-z0-9-]+\.\d+[a-z]?\b", normalized):
+            if re.search(r"\b(rack|cabinet)\b", normalized) and re.search(r"\brack\s+[a-z0-9-]+\.\d+[a-z]?\b", normalized):
                 return part
 
         # Cabinet 0316 / Cabinet 001 are authoritative rack identifiers.
@@ -2075,9 +2075,13 @@ class PatchManagerImport(Job):
             keys.add(f"rack {number_token}")
 
         # Alphanumeric rack aliases, e.g. Rack 921-C-1.7B.
-        for alnum_rack_match in re.finditer(r"\brack\s+([a-z0-9-]+\.\d+[a-z]?)\b", normalized):
-            keys.add(alnum_rack_match.group(1))
-            keys.add(f"rack {alnum_rack_match.group(1)}")
+        # Only activate this path when the same token/string explicitly says
+        # Rack or Cabinet; do not treat loose alphanumeric equipment/customer
+        # fragments as rack IDs.
+        if re.search(r"\b(rack|cabinet)\b", normalized):
+            for alnum_rack_match in re.finditer(r"\brack\s+([a-z0-9-]+\.\d+[a-z]?)\b", normalized):
+                keys.add(alnum_rack_match.group(1))
+                keys.add(f"rack {alnum_rack_match.group(1)}")
 
         # Cabinet aliases, anywhere in the name/token.
         for cabinet_match in re.finditer(r"\bcabinet\s+([a-z0-9-]+)\b", normalized):
@@ -2302,7 +2306,14 @@ class PatchManagerImport(Job):
         if rack_match:
             candidates.append(f"Rack {rack_match.group(1)}.{int(rack_match.group(2))}")
 
-        alnum_rack_match = re.search(r"\brack\s+([A-Za-z0-9-]+\.\d+[A-Za-z]?)\b", unescaped, re.IGNORECASE)
+        alnum_rack_match = None
+        if re.search(r"\b(rack|cabinet)\b", unescaped, re.IGNORECASE):
+            alnum_rack_match = re.search(
+                r"\brack\s+([A-Za-z0-9-]+\.\d+[A-Za-z]?)\b",
+                unescaped,
+                re.IGNORECASE,
+            )
+
         if alnum_rack_match:
             candidates.append(f"Rack {alnum_rack_match.group(1)}")
             candidates.append(alnum_rack_match.group(1))
@@ -2737,7 +2748,7 @@ class PatchManagerImport(Job):
         if re.search(r"\brack\s+\d+\.\d+\b", normalized):
             return True
 
-        if re.search(r"\brack\s+[a-z0-9-]+\.\d+[a-z]?\b", normalized):
+        if re.search(r"\b(rack|cabinet)\b", normalized) and re.search(r"\brack\s+[a-z0-9-]+\.\d+[a-z]?\b", normalized):
             return True
 
         if re.search(r"^\d+\.\d+\b", normalized):
