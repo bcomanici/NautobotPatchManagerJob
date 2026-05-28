@@ -571,7 +571,15 @@ class PatchManagerImport(Job):
         for row in rows:
             name = self.clean(row.get(self.fields["device_name"]))
             if not name:
-                self.logger.warning("Skipping device without Equipment Label: %s", row)
+                name = self.clean(row.get(self.fields["device_type"]))
+                if name:
+                    self.logger.info(
+                        "Equipment Label is blank; using Equipment Template as device name: %s",
+                        name,
+                    )
+
+            if not name:
+                self.logger.warning("Skipping device without Equipment Label or Equipment Template: %s", row)
                 continue
 
             identifier_data = self.parse_equipment_identifier(self.clean(row.get(self.fields["device_identifier"])))
@@ -1203,57 +1211,60 @@ class PatchManagerImport(Job):
         existing_device = Device.objects.filter(name=device_name).first()
 
         for position in range(rack.u_height, 0, -1):
-            defaults = dict(base_defaults)
-            defaults["position"] = position
-            defaults["face"] = "front"
+            for face in ("front", "rear"):
+                defaults = dict(base_defaults)
+                defaults["position"] = position
+                defaults["face"] = face
 
-            conflict_qs = Device.objects.filter(
-                rack=rack,
-                position=position,
-                face="front",
-            )
-
-            if existing_device:
-                conflict_qs = conflict_qs.exclude(pk=existing_device.pk)
-
-            if conflict_qs.exists():
-                failed_positions.append(f"{position}:occupied")
-                continue
-
-            try:
-                with transaction.atomic():
-                    device, created = Device.objects.update_or_create(
-                        name=device_name,
-                        defaults=defaults,
-                    )
-
-                self.logger.info(
-                    "%s passive infrastructure device %s in rack %s at U%s",
-                    "Created" if created else "Updated",
-                    device.name,
-                    rack.name,
-                    position,
+                conflict_qs = Device.objects.filter(
+                    rack=rack,
+                    position=position,
+                    face=face,
                 )
-                return device
 
-            except ValidationError as exc:
-                message_dict = getattr(exc, "message_dict", {})
-                if "position" in message_dict or "face" in message_dict:
-                    failed_positions.append(f"{position}:validation")
+                if existing_device:
+                    conflict_qs = conflict_qs.exclude(pk=existing_device.pk)
+
+                if conflict_qs.exists():
+                    failed_positions.append(f"{position}/{face}:occupied")
                     continue
 
-                self.logger.warning(
-                    "Passive infrastructure device %s failed non-placement validation at rack=%s U%s: %s",
-                    device_name,
-                    rack.name,
-                    position,
-                    exc,
-                )
-                raise
+                try:
+                    with transaction.atomic():
+                        device, created = Device.objects.update_or_create(
+                            name=device_name,
+                            defaults=defaults,
+                        )
 
-            except (IntegrityError, DataError):
-                failed_positions.append(f"{position}:integrity")
-                continue
+                    self.logger.info(
+                        "%s passive infrastructure device %s in rack %s at U%s %s",
+                        "Created" if created else "Updated",
+                        device.name,
+                        rack.name,
+                        position,
+                        face,
+                    )
+                    return device
+
+                except ValidationError as exc:
+                    message_dict = getattr(exc, "message_dict", {})
+                    if "position" in message_dict or "face" in message_dict:
+                        failed_positions.append(f"{position}/{face}:validation")
+                        continue
+
+                    self.logger.warning(
+                        "Passive infrastructure device %s failed non-placement validation at rack=%s U%s face=%s: %s",
+                        device_name,
+                        rack.name,
+                        position,
+                        face,
+                        exc,
+                    )
+                    raise
+
+                except (IntegrityError, DataError):
+                    failed_positions.append(f"{position}/{face}:integrity")
+                    continue
 
         self.logger.warning(
             "Passive infrastructure device %s could not be placed in rack %s. Tried U positions: %s. "
@@ -1339,6 +1350,15 @@ class PatchManagerImport(Job):
             manufacturer=manufacturer,
             model=bucket_type,
         )
+
+        # Passive infrastructure such as bulkheads, panels, FDPs, and fiber
+        # management hardware frequently shares rack units or is not full-depth.
+        # Marking the type as not full-depth lets Nautobot model front/rear
+        # sharing more accurately.
+        if getattr(device_type, "is_full_depth", False):
+            device_type.is_full_depth = False
+            device_type.validated_save()
+            self.logger.info("Set passive device type %s to not full-depth", device_type.model)
 
         return device_type
 
