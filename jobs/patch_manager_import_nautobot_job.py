@@ -2589,24 +2589,104 @@ class PatchManagerImport(Job):
 
         return False
 
+    def build_strict_canonical_virtual_rack_name(
+        self,
+        identifier_parts: List[str],
+    ) -> str:
+        """
+        Strict single source of truth for virtual rack names.
+
+        This intentionally collapses provider/panel/MMR variants into one
+        canonical room/suite/DC/cage bucket before any Rack.update_or_create().
+        """
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+        if not parts:
+            return ""
+
+        for part in parts:
+            if self.looks_like_real_rack_reference(part):
+                return ""
+
+        site_name = self.get_rack_name_prefix_from_identifier(parts)
+        if not site_name:
+            return ""
+
+        context_text = " ".join(parts[1:])
+        normalized_context = self.normalize_pm_match_text(context_text)
+
+        # Suite always wins. This collapses Suite 804 MMR, DRT - Suite 804,
+        # Crown Castle Suite 804, Non NYSERNet Panels in Suite 804, etc.
+        suite = self.extract_suite_token(context_text)
+        if suite:
+            return self.safe_nautobot_name(f"{VIRTUAL_RACK_PREFIX} {site_name} {suite}")
+
+        # Stable cage/DC/MMR/room buckets when no suite exists.
+        if "nysernet cage" in normalized_context or "nysenet cage" in normalized_context:
+            return self.safe_nautobot_name(f"{VIRTUAL_RACK_PREFIX} {site_name} NYSERNet Cage")
+
+        dc_match = re.search(r"\bdc\s+(north|south|east|west)\b", context_text, re.IGNORECASE)
+        if dc_match:
+            return self.safe_nautobot_name(f"{VIRTUAL_RACK_PREFIX} {site_name} DC {dc_match.group(1).capitalize()}")
+
+        if re.search(r"\b(mmr|meet\s+me\s+room)\b", context_text, re.IGNORECASE):
+            return self.safe_nautobot_name(f"{VIRTUAL_RACK_PREFIX} {site_name} MMR")
+
+        if "telco room" in normalized_context:
+            return self.safe_nautobot_name(f"{VIRTUAL_RACK_PREFIX} {site_name} Telco Room")
+
+        if "danc" in normalized_context:
+            return self.safe_nautobot_name(f"{VIRTUAL_RACK_PREFIX} {site_name} DANC")
+
+        # Last resort: use the existing canonical bucket function, but do not
+        # allow provider/panel-only strings to become their own rack buckets.
+        bucket = self.build_virtual_rack_bucket_from_identifier(parts)
+        normalized_bucket = self.normalize_pm_match_text(bucket)
+
+        provider_or_panel_terms = (
+            "crown castle",
+            "centurylink",
+            "non nysernet panel",
+            "panel",
+            "panels",
+            "fdp",
+            "fiber",
+            "bulkhead",
+            "commscope",
+            "telect",
+        )
+
+        if normalized_bucket and not any(term in normalized_bucket for term in provider_or_panel_terms):
+            return self.normalize_virtual_rack_name(site_name, bucket)
+
+        return ""
+
+    def find_existing_virtual_rack_by_canonical_name(self, virtual_rack_name: str) -> Optional[Rack]:
+        if not virtual_rack_name:
+            return None
+
+        rack = Rack.objects.filter(name=virtual_rack_name).first()
+        if rack:
+            return rack
+
+        # Defensive lookup: if older runs created provider-fragmented names,
+        # prefer the canonical rack if one exists with the same normalized key.
+        normalized_target = self.normalize_pm_match_text(virtual_rack_name)
+        for existing_rack in Rack.objects.filter(name__startswith=f"{VIRTUAL_RACK_PREFIX} "):
+            if self.normalize_pm_match_text(existing_rack.name) == normalized_target:
+                return existing_rack
+
+        return None
+
     def get_or_create_virtual_rack_from_identifier_parts(
         self,
         identifier_parts: List[str],
         location: Optional[Location] = None,
     ) -> Optional[Rack]:
         """
-        Create a clearly marked virtual rack for unresolved non-rack infrastructure
-        buckets or location buckets.
+        Create/update a virtual rack only using strict canonical naming.
 
-        These are normal Nautobot Rack objects, but they are intentionally named
-        with the "Virtual" prefix so they are distinguishable from physical
-        cabinets.
-
-        Examples:
-        - Virtual New York City - PoP DRT - Suite 804 Meet Me Room Non NYSERNet Panels
-        - Virtual Syracuse datacenter DC North
-        - Virtual 32 AoA DRT MMR Non NYSERNet Panels
-        - Virtual Albany - PoP Suite 510 - CenturyLink
+        This prevents new virtual racks from being created for provider/panel
+        variants that should collapse into the same suite/MMR/DC/cage bucket.
         """
         if not identifier_parts:
             return None
@@ -2615,35 +2695,36 @@ class PatchManagerImport(Job):
         if not parts:
             return None
 
-        # If a real rack/cabinet-looking value exists anywhere in the identifier,
-        # do not create a virtual rack. The real rack normalizer should handle it.
-        for part in parts:
-            if self.looks_like_real_rack_reference(part):
-                return None
-
-        site_name = self.get_rack_name_prefix_from_identifier(parts)
-        virtual_bucket = self.build_virtual_rack_bucket_from_identifier(parts)
-
-        if not site_name or not virtual_bucket:
-            return None
-
-        virtual_rack_name = self.normalize_virtual_rack_name(site_name, virtual_bucket)
-
+        virtual_rack_name = self.build_strict_canonical_virtual_rack_name(parts)
         if not virtual_rack_name:
             return None
 
+        site_name = self.get_rack_name_prefix_from_identifier(parts)
         rack_location = location or self.get_or_create_location(site_name)
         status = self.get_status()
 
-        rack, created = Rack.objects.update_or_create(
-            name=virtual_rack_name,
-            location=rack_location,
-            defaults={
-                "status": status,
-                "u_height": DEFAULT_RACK_HEIGHT,
-                "comments": "Virtual rack created by Patch Manager import for non-rack infrastructure/location grouping.",
-            },
-        )
+        existing_rack = self.find_existing_virtual_rack_by_canonical_name(virtual_rack_name)
+
+        if existing_rack:
+            rack = existing_rack
+            created = False
+            Rack.objects.filter(pk=rack.pk).update(
+                location=rack_location,
+                status=status,
+                u_height=DEFAULT_RACK_HEIGHT,
+                comments="Virtual rack created by Patch Manager import for non-rack infrastructure/location grouping.",
+            )
+            rack.refresh_from_db()
+        else:
+            rack, created = Rack.objects.update_or_create(
+                name=virtual_rack_name,
+                location=rack_location,
+                defaults={
+                    "status": status,
+                    "u_height": DEFAULT_RACK_HEIGHT,
+                    "comments": "Virtual rack created by Patch Manager import for non-rack infrastructure/location grouping.",
+                },
+            )
 
         self.add_rack_to_lookup_cache(rack)
 
