@@ -1137,7 +1137,11 @@ class PatchManagerImport(Job):
             identifier_data.get("address") or "",
         )
 
-        rack = self.find_existing_rack_from_names(identifier_parts)
+        rack = self.resolve_passive_patch_panel_rack(
+            identifier=identifier,
+            identifier_parts=identifier_parts,
+            location=location,
+        )
         if not rack:
             self.logger.warning(
                 "Passive patch panel row could not resolve a real rack; leaving unmatched. "
@@ -1173,6 +1177,122 @@ class PatchManagerImport(Job):
             rack=rack,
             base_defaults=base_defaults,
         )
+
+    def resolve_passive_patch_panel_rack(
+        self,
+        identifier: str,
+        identifier_parts: List[str],
+        location: Optional[Location],
+    ) -> Optional[Rack]:
+        """
+        Resolve a real, already-imported rack for promoted passive patch panels.
+
+        Resolution order is deliberately conservative:
+        1. Existing regular-device rack lookup across identifier parts.
+        2. Exact rack matches found anywhere in the identifier.
+        3. Inherit the rack from an already-mounted device token in the identifier.
+        4. Location-scoped fallback only when unambiguous, or when context tokens
+           overlap strongly enough with one rack at that location.
+
+        This method never creates virtual racks.
+        """
+        rack = self.find_existing_rack_from_names(identifier_parts)
+        if rack:
+            return rack
+
+        matched_racks = self.find_racks_in_identifier(identifier_parts)
+        if len(matched_racks) == 1:
+            return matched_racks[0]
+        if len(matched_racks) > 1:
+            rack = self.choose_best_rack_candidate(matched_racks, identifier_parts)
+            if rack:
+                return rack
+
+        parent_device = self.find_imported_device_in_identifier(identifier)
+        if parent_device and parent_device.rack_id:
+            self.logger.info(
+                "Resolved passive patch panel rack from mounted device token: device=%s rack=%s",
+                parent_device.name,
+                parent_device.rack.name,
+            )
+            return parent_device.rack
+
+        parent_device = self.find_parent_device_by_right_to_left_scan(
+            identifier_parts=identifier_parts,
+            matched_racks=matched_racks,
+        )
+        if parent_device and parent_device.rack_id:
+            self.logger.info(
+                "Resolved passive patch panel rack from right-to-left mounted device scan: device=%s rack=%s",
+                parent_device.name,
+                parent_device.rack.name,
+            )
+            return parent_device.rack
+
+        return self.find_existing_rack_by_location_context(identifier_parts, location)
+
+    def find_existing_rack_by_location_context(
+        self,
+        identifier_parts: List[str],
+        location: Optional[Location],
+    ) -> Optional[Rack]:
+        """
+        Last-resort real-rack fallback for passive patch panels.
+
+        If the resolved location has exactly one rack, use it. If it has multiple
+        racks, require meaningful context-token overlap with a specific rack name.
+        """
+        if not location:
+            return None
+
+        location_racks = list(Rack.objects.filter(location=location))
+        if not location_racks:
+            return None
+
+        if len(location_racks) == 1:
+            self.logger.info(
+                "Resolved passive patch panel rack by single-rack location fallback: location=%s rack=%s",
+                location.name,
+                location_racks[0].name,
+            )
+            return location_racks[0]
+
+        context = " ".join(
+            part.replace("<COMMA>", ",")
+            for part in identifier_parts
+            if self.clean(part)
+        )
+        normalized_context = self.normalize_pm_match_text(context)
+        context_tokens = self.get_rack_context_tokens(normalized_context)
+
+        scored: List[Tuple[int, int, str, Rack]] = []
+        for rack in location_racks:
+            rack_name = self.normalize_pm_match_text(rack.name)
+            rack_tokens = self.get_rack_context_tokens(rack_name)
+            score = len(context_tokens & rack_tokens) * 10
+
+            for part in identifier_parts:
+                normalized_part = self.normalize_pm_match_text(part.replace("<COMMA>", ","))
+                if normalized_part and normalized_part in rack_name:
+                    score += 25
+                if normalized_part and rack_name in normalized_part:
+                    score += 25
+
+            scored.append((score, len(rack.name), rack.name, rack))
+
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        best_score, _, _, best_rack = scored[0]
+
+        if best_score >= 20:
+            self.logger.info(
+                "Resolved passive patch panel rack by location context fallback: location=%s rack=%s score=%s",
+                location.name,
+                best_rack.name,
+                best_score,
+            )
+            return best_rack
+
+        return None
 
     def find_existing_rack_from_names(self, rack_names: List[str]) -> Optional[Rack]:
         """
