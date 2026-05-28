@@ -15,7 +15,7 @@ from django.core.exceptions import ValidationError
 from django.db import DataError, IntegrityError, transaction
 from nautobot.apps.jobs import BooleanVar, ChoiceVar, IntegerVar, Job, StringVar
 from nautobot.dcim.models import Cable, Device, DeviceType, Interface, Location, LocationType, Manufacturer, Rack
-from nautobot.extras.models import Note, Role, SecretsGroup, SecretsGroupAssociation, Status
+from nautobot.extras.models import Role, SecretsGroup, SecretsGroupAssociation, Status
 
 
 DEFAULT_FORMATS = {
@@ -92,8 +92,6 @@ PORT_DETAIL_FIELDS = (
 
 PM_PORT_DETAILS_START = "## Patch Manager Port Details"
 PM_PORT_DETAILS_END = "## End Patch Manager Port Details"
-
-PM_PORT_DETAILS_NOTE_TITLE = "Patch Manager Port Details"
 
 CONNECTION_SPLIT_RE = re.compile(r"\s*\|\s*|\s*;\s*")
 PM_TEMPLATE_BRACKET_RE = re.compile(r"\[[^\]]+\]")
@@ -807,8 +805,14 @@ class PatchManagerImport(Job):
 
         for device_id, detail_rows in details_by_device_id.items():
             device = Device.objects.get(pk=device_id)
-            self.replace_pm_port_details_note(device, detail_rows)
-            self.logger.info("Updated Patch Manager port details note on device %s", device.name)
+            updated_comments = self.replace_pm_port_details_block(device.comments or "", detail_rows)
+
+            # This pass only updates comments. Use a direct column update so an
+            # existing device with a rack-placement issue does not fail the
+            # whole sync when Nautobot revalidates rack occupancy.
+            Device.objects.filter(pk=device.pk).update(comments=updated_comments)
+
+            self.logger.info("Updated Patch Manager port details on device %s", device.name)
 
     def get_or_create_interface_for_child_row(
         self,
@@ -1688,68 +1692,6 @@ class PatchManagerImport(Job):
             wrapped_rows.append(wrapped)
 
         return wrapped_rows
-
-    def replace_pm_port_details_note(self, device: Device, detail_rows: List[Dict[str, str]]) -> None:
-        """
-        Create/update a single Patch Manager sync Note assigned to this device.
-
-        This is intentionally the only behavior change from the low-virtual
-        baseline: PM detail blocks go to Notes instead of Device.comments.
-        """
-        note_body = self.render_pm_port_details_note_body(detail_rows)
-        content_type = ContentType.objects.get_for_model(Device)
-
-        existing_note = (
-            Note.objects.filter(
-                assigned_object_type=content_type,
-                assigned_object_id=device.pk,
-                note__contains=PM_PORT_DETAILS_START,
-            )
-            .order_by("-last_updated")
-            .first()
-        )
-
-        if existing_note:
-            existing_note.note = note_body
-            existing_note.validated_save()
-            return
-
-        create_kwargs = {
-            "assigned_object_type": content_type,
-            "assigned_object_id": device.pk,
-            "note": note_body,
-        }
-
-        user = getattr(self, "user", None)
-        if user:
-            create_kwargs["user"] = user
-
-        try:
-            note = Note(**create_kwargs)
-            note.validated_save()
-        except Exception as exc:
-            self.logger.warning(
-                "Could not create Patch Manager note for device %s: %s. Falling back to comments.",
-                device.name,
-                exc,
-            )
-            updated_comments = self.replace_pm_port_details_block(device.comments or "", detail_rows)
-            Device.objects.filter(pk=device.pk).update(comments=updated_comments)
-
-    def render_pm_port_details_note_body(self, detail_rows: List[Dict[str, str]]) -> str:
-        rendered_block = self.render_pm_port_details_block(detail_rows)
-        rendered_block = rendered_block.replace(PM_PORT_DETAILS_START, "").replace(PM_PORT_DETAILS_END, "").strip()
-
-        return "\n".join(
-            [
-                PM_PORT_DETAILS_START,
-                f"# {PM_PORT_DETAILS_NOTE_TITLE}",
-                "",
-                rendered_block,
-                "",
-                PM_PORT_DETAILS_END,
-            ]
-        )
 
     def extract_port_detail_fields(self, row: Dict[str, Any]) -> Dict[str, str]:
         details: Dict[str, str] = {}
