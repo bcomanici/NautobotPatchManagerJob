@@ -159,7 +159,6 @@ class PatchManagerClient:
 
 
 class PatchManagerImport(Job):
-    """Import Patch Manager cabinets, equipment, and cables into Nautobot."""
 
     class Meta:
         name = "Import Patch Manager Inventory"
@@ -437,7 +436,6 @@ class PatchManagerImport(Job):
             "nysenet cage",
         }
 
-        # Explicit rack-number references such as Rack 101.02 Panel 2.
         for part in reversed(parts):
             normalized = self.normalize_pm_match_text(part)
             if normalized in ignored:
@@ -449,7 +447,6 @@ class PatchManagerImport(Job):
             if re.search(r"\b(rack|cabinet)\b", normalized) and re.search(r"\brack\s+[a-z0-9-]+\.\d+[a-z]?\b", normalized):
                 return part
 
-        # Cabinet 0316 / Cabinet 001 are authoritative rack identifiers.
         for part in reversed(parts):
             normalized = self.normalize_pm_match_text(part)
             if normalized in ignored:
@@ -458,7 +455,6 @@ class PatchManagerImport(Job):
             if re.search(r"\bcabinet\s+[a-z0-9-]+\b", normalized):
                 return part
 
-        # 177828-COLO-CCF-style cabinet IDs are authoritative rack identifiers.
         for part in reversed(parts):
             normalized = self.normalize_pm_match_text(part)
             if normalized in ignored:
@@ -467,7 +463,6 @@ class PatchManagerImport(Job):
             if re.search(r"\b\d{5,}-colo-[a-z0-9-]+\b", normalized):
                 return part
 
-        # Leading decimal rack identifiers such as 2405.14 NYPH.
         for part in reversed(parts):
             normalized = self.normalize_pm_match_text(part)
             if normalized in ignored:
@@ -786,9 +781,6 @@ class PatchManagerImport(Job):
         for interface_id, detail_rows in details_by_interface_id.items():
             interface = Interface.objects.select_related("device").get(pk=interface_id)
 
-            # Interface.description is varchar(255) in Nautobot, so keep only a
-            # compact summary there. Mirror the full PM detail block into the
-            # parent device comments under the interface name.
             updated_description = self.build_interface_description_summary(detail_rows)
 
             try:
@@ -808,20 +800,11 @@ class PatchManagerImport(Job):
                 self.wrap_interface_detail_rows(interface.name, detail_rows)
             )
 
-            self.logger.info(
-                "Updated Patch Manager port details on interface %s:%s",
-                interface.device.name,
-                interface.name,
-            )
 
         for device_id, detail_rows in details_by_device_id.items():
             device = Device.objects.get(pk=device_id)
             self.replace_pm_port_details_note(device, detail_rows)
 
-            self.logger.info(
-                "Updated Patch Manager port details note on device %s",
-                device.name,
-            )
 
     def get_or_create_interface_for_child_row(
         self,
@@ -842,7 +825,6 @@ class PatchManagerImport(Job):
         if not parsed:
             return None
 
-        # Priority 1: exact parent from parsed pattern.
         parent_device = None
         parent_token = parsed.get("parent_device", "")
         if parent_token:
@@ -851,8 +833,6 @@ class PatchManagerImport(Job):
                 matched_racks=matched_racks,
             )
 
-        # Priority 2: scan all identifier tokens right-to-left for any mounted
-        # parent device before passive infrastructure fallback.
         if not parent_device:
             parent_device = self.find_parent_device_by_right_to_left_scan(
                 identifier_parts=identifier_parts,
@@ -975,12 +955,9 @@ class PatchManagerImport(Job):
 
         parent_device = ""
 
-        # First try the normal parent position for ..., parent, slot, interface.
         if len(identifier_parts) >= 3:
             parent_device = identifier_parts[-3]
 
-        # If that does not look like a real parent token, leave it blank. The
-        # right-to-left scan in get_or_create_interface_for_child_row will find it.
         if parent_device and self.looks_like_non_parent_identifier_token(parent_device):
             parent_device = ""
 
@@ -1347,10 +1324,6 @@ class PatchManagerImport(Job):
             model=bucket_type,
         )
 
-        # Passive infrastructure such as bulkheads, panels, FDPs, and fiber
-        # management hardware frequently shares rack units or is not full-depth.
-        # Marking the type as not full-depth lets Nautobot model front/rear
-        # sharing more accurately.
         if getattr(device_type, "is_full_depth", False):
             device_type.is_full_depth = False
             device_type.validated_save()
@@ -1766,22 +1739,6 @@ class PatchManagerImport(Job):
 
         return details
 
-    def replace_pm_port_details_block(self, existing_comments: str, detail_rows: List[Dict[str, str]]) -> str:
-        base_comments = self.strip_pm_port_details_block(existing_comments).rstrip()
-        new_block = self.render_pm_port_details_block(detail_rows)
-
-        if base_comments:
-            return f"{base_comments}\n\n{new_block}"
-
-        return new_block
-
-    def strip_pm_port_details_block(self, comments: str) -> str:
-        pattern = re.compile(
-            rf"\n*{re.escape(PM_PORT_DETAILS_START)}.*?{re.escape(PM_PORT_DETAILS_END)}\n*",
-            re.DOTALL,
-        )
-        return pattern.sub("\n", comments or "").strip()
-
     def render_pm_port_details_block(self, detail_rows: List[Dict[str, str]]) -> str:
         lines = [PM_PORT_DETAILS_START]
 
@@ -1905,12 +1862,6 @@ class PatchManagerImport(Job):
         if not value:
             return None, "front"
 
-        # Only accept explicit rack-unit notation:
-        # - U45
-        # - U 45
-        # - 45U
-        #
-        # Do not treat physical dimensions such as "2.45', 1.33', 0'" as U45.
         u_match = re.search(
             r"(?<![\d.])U\s*(\d+)\b|\b(\d+)\s*U\b",
             value,
@@ -2036,35 +1987,25 @@ class PatchManagerImport(Job):
             self.normalize_rack_name_order(normalized),
         }
 
-        # Rack-number aliases.
         for number_token in self.extract_rack_number_tokens(normalized):
             keys.add(number_token)
             keys.add(f"rack {number_token}")
 
-        # Alphanumeric rack aliases, e.g. Rack 921-C-1.7B.
-        # Only activate this path when the same token/string explicitly says
-        # Rack or Cabinet; do not treat loose alphanumeric equipment/customer
-        # fragments as rack IDs.
         if re.search(r"\b(rack|cabinet)\b", normalized):
             for alnum_rack_match in re.finditer(r"\brack\s+([a-z0-9-]+\.\d+[a-z]?)\b", normalized):
                 keys.add(alnum_rack_match.group(1))
                 keys.add(f"rack {alnum_rack_match.group(1)}")
 
-        # Cabinet aliases, anywhere in the name/token.
         for cabinet_match in re.finditer(r"\bcabinet\s+([a-z0-9-]+)\b", normalized):
             keys.add(f"cabinet {cabinet_match.group(1)}")
 
-        # COLO cabinet aliases, anywhere in the name/token.
         for colo_match in re.finditer(r"\b(\d{5,}-colo-[a-z0-9-]+)\b", normalized):
             keys.add(colo_match.group(1))
 
-        # Leading decimal rack aliases, preserving the whole token.
         decimal_match = re.search(r"^(\d+\.\d+\b.*)$", normalized)
         if decimal_match:
             keys.add(decimal_match.group(1).strip())
 
-        # Also add embedded decimal rack aliases when they look like cabinet IDs
-        # or rack/location IDs in a longer imported rack name.
         for embedded_decimal in re.finditer(r"\b(\d+\.\d+\b[^,]*)", normalized):
             keys.add(embedded_decimal.group(1).strip())
 
@@ -2168,7 +2109,6 @@ class PatchManagerImport(Job):
 
             score = len(context_tokens & rack_tokens) * 10
 
-            # Stronger signal for exact phrase containment.
             for part in identifier_parts:
                 normalized_part = self.normalize_pm_match_text(part.replace("<COMMA>", ","))
                 if normalized_part and normalized_part in rack_name:
@@ -2176,7 +2116,6 @@ class PatchManagerImport(Job):
                 if normalized_part and rack_name in normalized_part:
                     score += 25
 
-            # Prefer candidate whose location name appears in the identifier.
             if getattr(rack, "location", None):
                 location_name = self.normalize_pm_match_text(rack.location.name)
                 if location_name and location_name in normalized_context:
@@ -2190,6 +2129,12 @@ class PatchManagerImport(Job):
 
         if best_score <= 0:
             return None
+
+        self.logger.info(
+            "Resolved ambiguous rack alias to %s using identifier context. candidates=%s",
+            best_rack.name,
+            [rack.name for rack in candidates],
+        )
 
         return best_rack
 
@@ -2366,11 +2311,6 @@ class PatchManagerImport(Job):
 
         candidates: List[str] = []
 
-        # If the rack token is generic/plain, also include the hierarchy token
-        # immediately before it. This handles identifiers like:
-        #   NYSERNet Backbone,Rochester - PoPs,211 Bailey Rd...,Telco Room,Rack,Bailey-3000r7
-        # matching imported rack:
-        #   Rochester - PoPs Telco Room Rack
         previous_context = self.get_identifier_token_before_value(
             value=clean_value,
             identifier_parts=identifier_parts,
@@ -2434,11 +2374,9 @@ class PatchManagerImport(Job):
         if normalized_context in ignored:
             return False
 
-        # Avoid pure street addresses; location rooms/suites/telco rooms are useful.
         if re.search(r"\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|court|ct|drive|dr)", normalized_context):
             return False
 
-        # Avoid using device-looking hostnames as rack context.
         if re.match(r"^[a-z]{2,10}[a-z0-9]*-[a-z0-9][a-z0-9-]*$", normalized_context):
             return False
 
@@ -2504,8 +2442,6 @@ class PatchManagerImport(Job):
         if not parts:
             return None
 
-        # If a real rack-looking value exists anywhere in the identifier, do not
-        # create a virtual rack. The real rack normalizer should handle it.
         for part in parts:
             if self.looks_like_real_rack_reference(part):
                 return None
@@ -2587,7 +2523,6 @@ class PatchManagerImport(Job):
         if not left or not right:
             return bucket
 
-        # Preserve if the right side contains a clear street/building address.
         if re.search(
             r"\b\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|court|ct|drive|dr|broad|main)\b",
             right,
@@ -2613,19 +2548,15 @@ class PatchManagerImport(Job):
         if not tokens:
             return bucket
 
-        # Remove trailing equipment/service descriptors.
         while tokens and re.sub(r"[^a-z0-9]+", "", tokens[-1].lower()) in stop_words:
             tokens.pop()
 
-        # Remove trailing hostname/device-like tokens.
         while tokens and re.match(r"^[a-z]{2,10}[a-z0-9]*-[a-z0-9][a-z0-9-]*$", tokens[-1].lower()):
             tokens.pop()
 
         if not tokens:
             return bucket
 
-        # Collapse repeated phrase tails, e.g. "Alfred University Alfred Router"
-        # should keep "Alfred University".
         left_tokens = [t.lower() for t in re.split(r"\W+", left) if t]
         if left_tokens:
             first_left = left_tokens[0]
