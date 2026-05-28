@@ -57,7 +57,6 @@ DEFAULT_DEVICE_ROLE_NAME = "Patch Manager Imported"
 DEFAULT_PASSIVE_ROLE_NAME = "Patch Manager Passive Infrastructure"
 DEFAULT_PASSIVE_MANUFACTURER_NAME = "Generic"
 DEFAULT_RACK_HEIGHT = 45
-VIRTUAL_RACK_PREFIX = "Virtual"
 MAX_NAUTOBOT_NAME_LENGTH = 255
 MAX_INTERFACE_NAME_LENGTH = 255
 MAX_INTERFACE_DESCRIPTION_LENGTH = 255
@@ -2421,24 +2420,40 @@ class PatchManagerImport(Job):
 
         return False
 
+    def build_virtual_rack_comments(
+        self,
+        original_virtual_part: str,
+        collapsed_virtual_part: str,
+    ) -> str:
+        base_comment = "Virtual rack created by Patch Manager import for non-rack infrastructure grouping."
+
+        removed_tail = self.get_equals_virtual_rack_removed_tail(
+            original_value=original_virtual_part,
+            collapsed_value=collapsed_virtual_part,
+        )
+
+        if not removed_tail:
+            return base_comment
+
+        return (
+            f"{base_comment}\n\n"
+            f"Patch Manager virtual rack name was consolidated. "
+            f"Removed non-location tail retained for traceability: {removed_tail}"
+        )
+
     def get_or_create_virtual_rack_from_identifier_parts(
         self,
         identifier_parts: List[str],
         location: Optional[Location] = None,
     ) -> Optional[Rack]:
         """
-        Create a clearly marked virtual rack for unresolved non-rack infrastructure
-        buckets or location buckets.
+        Create a virtual rack only for unresolved non-rack infrastructure buckets.
 
-        These are normal Nautobot Rack objects, but they are intentionally named
-        with the "Virtual" prefix so they are distinguishable from physical
-        cabinets.
-
-        Examples:
-        - Virtual New York City - PoP DRT - Suite 804 Meet Me Room Non NYSERNet Panels
-        - Virtual Syracuse datacenter DC North
-        - Virtual 32 AoA DRT MMR Non NYSERNet Panels
-        - Virtual Albany - PoP Suite 510 - CenturyLink
+        This deliberately does NOT create virtual racks from:
+        - generic location hierarchy tokens
+        - actual rack-looking strings
+        - customer/descriptor tokens such as Netflix
+        - device names
         """
         if not identifier_parts:
             return None
@@ -2447,19 +2462,19 @@ class PatchManagerImport(Job):
         if not parts:
             return None
 
-        # If a real rack/cabinet-looking value exists anywhere in the identifier,
-        # do not create a virtual rack. The real rack normalizer should handle it.
+        # If a real rack-looking value exists anywhere in the identifier, do not
+        # create a virtual rack. The real rack normalizer should handle it.
         for part in parts:
             if self.looks_like_real_rack_reference(part):
                 return None
 
-        site_name = self.get_rack_name_prefix_from_identifier(parts)
-        virtual_bucket = self.build_virtual_rack_bucket_from_identifier(parts)
-
-        if not site_name or not virtual_bucket:
+        virtual_part = self.find_virtual_rack_part(parts)
+        if not virtual_part:
             return None
 
-        virtual_rack_name = self.normalize_virtual_rack_name(site_name, virtual_bucket)
+        site_name = parts[0]
+        collapsed_virtual_part = self.normalize_equals_virtual_rack_bucket(virtual_part)
+        virtual_rack_name = self.normalize_virtual_rack_name(site_name, virtual_part)
 
         if not virtual_rack_name:
             return None
@@ -2467,355 +2482,150 @@ class PatchManagerImport(Job):
         rack_location = location or self.get_or_create_location(site_name)
         status = self.get_status()
 
+        comments = self.build_virtual_rack_comments(
+            original_virtual_part=virtual_part,
+            collapsed_virtual_part=collapsed_virtual_part,
+        )
+
         rack, created = Rack.objects.update_or_create(
             name=virtual_rack_name,
             location=rack_location,
             defaults={
                 "status": status,
                 "u_height": DEFAULT_RACK_HEIGHT,
-                "comments": "Virtual rack created by Patch Manager import for non-rack infrastructure/location grouping.",
+                "comments": comments,
             },
         )
 
         self.add_rack_to_lookup_cache(rack)
 
         self.logger.info(
-            "%s virtual rack %s for unresolved Patch Manager infrastructure/location bucket",
+            "%s virtual rack %s for unresolved Patch Manager infrastructure bucket",
             "Created" if created else "Updated",
             rack.name,
         )
 
         return rack
 
-    def build_virtual_rack_bucket_from_identifier(self, parts: List[str]) -> str:
-        """
-        Build a canonical virtual rack bucket from useful room/suite/cage/MMR
-        context while avoiding duplicate virtual racks for the same suite.
-
-        Examples:
-        - DRT - Suite 804 + Meet Me Room -> Suite 804 MMR
-        - Suite 804 + Meet Me Room -> Suite 804 MMR
-        - Crown Castle - Suite 801 -> Suite 801 Crown Castle
-        - NYSERNet Cage -> NYSERNet Cage
-        - DC North -> DC North
-        """
-        if not parts:
-            return ""
-
-        prefix = self.get_rack_name_prefix_from_identifier(parts)
-        normalized_prefix = self.normalize_pm_match_text(prefix)
-
-        cleaned_parts: List[str] = []
-        for part in parts[1:]:
-            cleaned = self.normalize_virtual_rack_part(part)
-            normalized = self.normalize_pm_match_text(cleaned)
-
-            if not cleaned or not normalized:
-                continue
-
-            if normalized == normalized_prefix:
-                continue
-
-            if normalized in self.get_virtual_rack_ignored_tokens():
-                continue
-
-            if self.looks_like_real_rack_reference(cleaned):
-                continue
-
-            if self.looks_like_device_or_interface_identifier(cleaned):
-                continue
-
-            if self.looks_like_street_address_token(normalized):
-                continue
-
-            cleaned_parts.append(cleaned)
-
-        canonical = self.canonicalize_virtual_rack_bucket(cleaned_parts)
-        if canonical:
-            return canonical
-
-        useful_parts: List[str] = []
-        for cleaned in cleaned_parts:
-            if self.is_useful_virtual_rack_context(cleaned):
-                if cleaned not in useful_parts:
-                    useful_parts.append(cleaned)
-
-        return " ".join(useful_parts).strip()
-
-    def canonicalize_virtual_rack_bucket(self, cleaned_parts: List[str]) -> str:
-        """
-        Collapse virtual rack location strings into stable location buckets only.
-
-        The virtual rack name should identify where the passive/fiber grouping
-        lives, not the carrier, panel, FDP, ODP, device, chassis, customer, or
-        circuit/shelf identifier.
-
-        Keep:
-        - Suite number
-        - MMR / Meet Me Room
-        - NYSERNet Cage
-        - DC North/South/East/West
-        - Telco Room
-        - floor-level location where no better room exists
-        - street/building identity for NYC Dark Fiber FDP sites
-
-        Drop:
-        - provider names
-        - panel/FDP/ODP/LGX labels
-        - device/chassis names
-        - customer/service names
-        - Ciena/ASR/etc. equipment text
-        """
-        if not cleaned_parts:
-            return ""
-
-        joined = " ".join(cleaned_parts)
-        joined_norm = self.normalize_pm_match_text(joined)
-
-        # Suite wins and intentionally drops provider/MMR/panel qualifiers.
-        suite = self.extract_suite_token(joined)
-        if suite:
-            return suite
-
-        # Stable room/cage/DC buckets.
-        if "nysernet cage" in joined_norm or "nysenet cage" in joined_norm:
-            return "NYSERNet Cage"
-
-        dc_match = re.search(r"\bdc\s+(north|south|east|west)\b", joined, re.IGNORECASE)
-        if dc_match:
-            return f"DC {dc_match.group(1).capitalize()}"
-
-        if re.search(r"\b(mmr|meet\s+me\s+room)\b", joined, re.IGNORECASE):
-            return "MMR"
-
-        if "telco room" in joined_norm:
-            return "Telco Room"
-
-        # Preserve a clear floor bucket when no suite/room exists.
-        floor_match = re.search(r"\b(\d+(?:st|nd|rd|th)\s+floor)\b", joined, re.IGNORECASE)
-        if floor_match:
-            return floor_match.group(1).title()
-
-        # Preserve building/street identity for NYC Dark Fiber style FDP sites,
-        # while stripping FDP/panel/LGX/north/south suffixes.
-        dark_fiber_address = self.extract_dark_fiber_address_bucket(joined)
-        if dark_fiber_address:
-            return dark_fiber_address
-
-        # Stable named special areas.
-        if "danc" in joined_norm:
-            return "DANC"
-
-        # Last resort: choose the first stable location-like token and reject
-        # provider/equipment/panel tokens. This prevents names like:
-        #   Virtual ... Coresite St John's ASR 1001x colo
-        #   Virtual ... Windstream DANC Ciena
-        for cleaned in cleaned_parts:
-            cleaned = self.normalize_virtual_rack_part(cleaned)
-            normalized = self.normalize_pm_match_text(cleaned)
-
-            if not cleaned or not normalized:
-                continue
-
-            if self.is_virtual_rack_fragment_noise(normalized):
-                continue
-
-            if self.looks_like_device_or_interface_identifier(cleaned):
-                continue
-
-            if self.looks_like_equipment_specific_virtual_fragment(cleaned):
-                continue
-
-            if self.looks_like_street_address_token(normalized):
-                # Keep only the address itself, not provider/equipment suffixes.
-                return self.clean_address_like_virtual_bucket(cleaned)
-
-            return cleaned
-
-        return ""
-
-    @staticmethod
-    def extract_dark_fiber_address_bucket(value: str) -> str:
-        text = re.sub(r"\s+", " ", value or "").strip()
-
-        # Examples:
-        # - 205 E 42nd FDP north -> 205 E 42nd
-        # - 395 Hudson Panel 1 -> 395 Hudson
-        # - 53rd St Entrance MOMA FDP LGX02 -> 53rd St Entrance MOMA
-        patterns = (
-            r"\b(\d+\s+(?:e|east|w|west)?\s*\d+(?:st|nd|rd|th)?(?:\s+st|\s+street|\s+ave|\s+avenue)?)\b",
-            r"\b(\d+\s+[a-z]+(?:\s+[a-z]+)?)\s+(?:panel|fdp|lgx)\b",
-            r"\b(\d+(?:st|nd|rd|th)\s+st\s+entrance\s+[a-z0-9 ]+?)\s+(?:fdp|lgx|panel)\b",
-        )
-
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                bucket = re.sub(r"\s+", " ", match.group(1)).strip()
-                return bucket
-
-        return ""
-
-    @staticmethod
-    def clean_address_like_virtual_bucket(value: str) -> str:
-        cleaned = re.sub(
-            r"\b(panel\s*\d+|fdp\s*(north|south|east|west)?|lgx\d+|odp[.a-z0-9-]*)\b",
-            "",
-            value or "",
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -")
-        return cleaned
-
-    @staticmethod
-    def is_virtual_rack_fragment_noise(normalized: str) -> bool:
-        noise_terms = (
-            "crown castle",
-            "centurylink",
-            "windstream",
-            "coresite",
-            "atlantic metro",
-            "njedge",
-            "non nysernet panel",
-            "panel",
-            "panels",
-            "fdp",
-            "odp",
-            "lgx",
-            "fiber",
-            "bulkhead",
-            "commscope",
-            "telect",
-            "ciena",
-            "asr",
-            "st john",
-            "colo",
-            "equipment",
-        )
-
-        return any(term in normalized for term in noise_terms)
-
-    @staticmethod
-    def looks_like_equipment_specific_virtual_fragment(value: str) -> bool:
-        token = re.sub(r"\s+", " ", (value or "").strip().lower())
-
-        if not token:
-            return True
-
-        equipment_patterns = (
-            r"\b(asr|ncs|mx|ex|qfx|ciena|adva|ekinops|cisco|juniper)\b",
-            r"\b\d+[a-z]*\s*(?:g|ge|gbe|lr|sr|er|zr)\b",
-            r"\bodp[.a-z0-9-]*\b",
-            r"\blgx\d+\b",
-            r"\bpanel\s*\d+\b",
-            r"\bfdp\b",
-            r"\b[a-z]{2,10}[a-z0-9]*-[a-z0-9][a-z0-9-]*\b",
-        )
-
-        return any(re.search(pattern, token) for pattern in equipment_patterns)
-
-    @staticmethod
-    def extract_suite_token(value: str) -> str:
-        match = re.search(r"\bsuite\s*([a-z0-9-]+)\b", value or "", re.IGNORECASE)
-        if not match:
-            return ""
-
-        return f"Suite {match.group(1).upper()}"
-
-    @staticmethod
-    def normalize_virtual_rack_part(value: str) -> str:
-        part = (value or "").replace("<COMMA>", ",").strip()
-        part = re.sub(r"\s+", " ", part)
-        return part
-
-    @staticmethod
-    def get_virtual_rack_ignored_tokens() -> set:
-        return set(IGNORED_RACK_LOOKUP_TOKENS) | {
-            "nysernet backbone",
-            "customer locations",
-            "customer location",
-            "colocation",
-            "colo",
-            "nysernet cage",
-            "nysenet cage",
-        }
-
-    @staticmethod
-    def looks_like_street_address_token(normalized_value: str) -> bool:
-        return bool(
-            re.search(
-                r"\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|court|ct|drive|dr|broad|main|kelsy)",
-                normalized_value or "",
-            )
-        )
-
-    @staticmethod
-    def looks_like_device_or_interface_identifier(value: str) -> bool:
-        token = re.sub(r"\s+", " ", (value or "").strip().lower())
-
-        if not token:
-            return True
-
-        if re.match(r"^[a-z]{2,10}[a-z0-9]*-[a-z0-9][a-z0-9-]*$", token):
-            return True
-
-        if re.match(r"^\d+$", token):
-            return True
-
-        if "/" in token and re.search(r"\d+/\d+", token):
-            return True
-
-        if re.match(r"^(xe|ge|et|fe|te|gi|eth|qsfp|sfp|xfp|cfp)", token):
-            return True
-
-        return False
-
-    @staticmethod
-    def is_useful_virtual_rack_context(value: str) -> bool:
-        normalized = re.sub(r"\s+", " ", (value or "").strip().lower())
-
-        useful_keywords = (
-            "room",
-            "suite",
-            "mmr",
-            "meet me",
-            "cage",
-            "panel",
-            "panels",
-            "fdp",
-            "fiber",
-            "bulkhead",
-            "commscope",
-            "telect",
-            "dc north",
-            "dc south",
-            "danc",
-            "centurylink",
-            "crown castle",
-        )
-
-        return any(keyword in normalized for keyword in useful_keywords)
-
-    @staticmethod
-    def normalize_virtual_rack_name(site_name: str, virtual_bucket: str) -> str:
+    def normalize_virtual_rack_name(self, site_name: str, virtual_part: str) -> str:
         site = re.sub(r"\s+", " ", (site_name or "").strip())
-        bucket = re.sub(r"\s+", " ", (virtual_bucket or "").strip())
+        bucket = re.sub(r"\s+", " ", (virtual_part or "").strip())
 
         if not site or not bucket:
             return ""
 
+        bucket = self.normalize_equals_virtual_rack_bucket(bucket)
+
         if bucket.lower().startswith(site.lower()):
-            base_name = bucket
-        else:
-            base_name = f"{site} {bucket}"
+            return self.safe_nautobot_name(bucket)
 
-        if not base_name.lower().startswith(VIRTUAL_RACK_PREFIX.lower() + " "):
-            base_name = f"{VIRTUAL_RACK_PREFIX} {base_name}"
+        return self.safe_nautobot_name(f"{site} {bucket}")
 
-        if len(base_name) > MAX_NAUTOBOT_NAME_LENGTH:
-            return base_name[:MAX_NAUTOBOT_NAME_LENGTH].rstrip()
+    @staticmethod
+    def normalize_equals_virtual_rack_bucket(value: str) -> str:
+        """
+        Conservative collapse for Patch Manager '<EQUALS>' virtual rack names.
 
-        return base_name
+        These often repeat the same customer/location on both sides, or add a
+        device/service tail after the major name. Collapse only when there is
+        no apparent address or major-name difference.
+
+        Examples:
+        - Alfred <EQUALS> Alfred University Alfred Router
+          -> Alfred <EQUALS> Alfred University
+        - Foo <EQUALS> Foo Bar Foo Bar Router
+          -> Foo <EQUALS> Foo Bar
+        """
+        bucket = re.sub(r"\s+", " ", (value or "").replace("<equals>", "<EQUALS>").strip())
+
+        if "<EQUALS>" not in bucket:
+            return bucket
+
+        left, right = [part.strip() for part in bucket.split("<EQUALS>", 1)]
+        if not left or not right:
+            return bucket
+
+        # Preserve if the right side contains a clear street/building address.
+        if re.search(
+            r"\b\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|court|ct|drive|dr|broad|main)\b",
+            right,
+            re.IGNORECASE,
+        ):
+            return bucket
+
+        stop_words = {
+            "router",
+            "switch",
+            "equipment",
+            "node",
+            "server",
+            "firewall",
+            "probe",
+            "loa",
+            "provided",
+            "nysernet",
+            "nys",
+        }
+
+        tokens = right.split()
+        if not tokens:
+            return bucket
+
+        # Remove trailing equipment/service descriptors.
+        while tokens and re.sub(r"[^a-z0-9]+", "", tokens[-1].lower()) in stop_words:
+            tokens.pop()
+
+        # Remove trailing hostname/device-like tokens.
+        while tokens and re.match(r"^[a-z]{2,10}[a-z0-9]*-[a-z0-9][a-z0-9-]*$", tokens[-1].lower()):
+            tokens.pop()
+
+        if not tokens:
+            return bucket
+
+        # Collapse repeated phrase tails, e.g. "Alfred University Alfred Router"
+        # should keep "Alfred University".
+        left_tokens = [t.lower() for t in re.split(r"\W+", left) if t]
+        if left_tokens:
+            first_left = left_tokens[0]
+            lowered_tokens = [re.sub(r"\W+", "", t.lower()) for t in tokens]
+            if first_left in lowered_tokens[1:]:
+                repeat_index = lowered_tokens[1:].index(first_left) + 1
+                tokens = tokens[:repeat_index]
+
+        cleaned_right = " ".join(tokens).strip()
+
+        if not cleaned_right or cleaned_right == right:
+            return bucket
+
+        return f"{left} <EQUALS> {cleaned_right}"
+
+    @staticmethod
+    def get_equals_virtual_rack_removed_tail(original_value: str, collapsed_value: str) -> str:
+        """
+        Return the portion removed by normalize_equals_virtual_rack_bucket(),
+        so it can be retained in Rack.comments for traceability.
+        """
+        original = re.sub(r"\s+", " ", (original_value or "").replace("<equals>", "<EQUALS>").strip())
+        collapsed = re.sub(r"\s+", " ", (collapsed_value or "").replace("<equals>", "<EQUALS>").strip())
+
+        if not original or not collapsed or original == collapsed:
+            return ""
+
+        if "<EQUALS>" not in original or "<EQUALS>" not in collapsed:
+            return ""
+
+        original_left, original_right = [part.strip() for part in original.split("<EQUALS>", 1)]
+        collapsed_left, collapsed_right = [part.strip() for part in collapsed.split("<EQUALS>", 1)]
+
+        if original_left != collapsed_left:
+            return ""
+
+        if not original_right.startswith(collapsed_right):
+            return ""
+
+        removed = original_right[len(collapsed_right):].strip(" -")
+
+        return removed
 
     @staticmethod
     def looks_like_real_rack_reference(value: str) -> bool:
@@ -2830,29 +2640,18 @@ class PatchManagerImport(Job):
         if re.search(r"^\d+\.\d+\b", normalized):
             return True
 
-        if re.search(r"\bcabinet\s+[a-z0-9-]+\b", normalized):
-            return True
-
-        if re.search(r"\b\d{5,}-colo-[a-z0-9-]+\b", normalized):
-            return True
-
         return False
 
     @staticmethod
     def find_virtual_rack_part(parts: List[str]) -> str:
         """
-        Backward-compatible helper. Prefer build_virtual_rack_bucket_from_identifier()
-        for new virtual rack naming.
+        Pick only true infrastructure bucket tokens for virtual rack creation.
         """
         virtual_keywords = (
             "fdp",
             "panel",
             "panels",
             "cage",
-            "fiber",
-            "bulkhead",
-            "commscope",
-            "telect",
         )
 
         ignored_exact = set(IGNORED_RACK_LOOKUP_TOKENS) | {
