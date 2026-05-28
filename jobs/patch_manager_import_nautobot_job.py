@@ -416,6 +416,21 @@ class PatchManagerImport(Job):
 
         return False
 
+    @staticmethod
+    def strip_pm_inline_markup(value: str) -> str:
+        """
+        Remove Patch Manager inline annotation text that can appear inside rack
+        identifiers, for example:
+            Rack 921-C-1.7B <OPEN>bottom half<CLOSE>
+        should normalize to:
+            Rack 921-C-1.7B
+        """
+        text = (value or "").replace("<COMMA>", ",")
+        text = re.sub(r"<OPEN>.*?<CLOSE>", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
     def find_precise_rack_identifier_part(self, parts: List[str]) -> str:
         ignored = set(IGNORED_RACK_LOOKUP_TOKENS) | {
             "nysernet cage",
@@ -429,6 +444,9 @@ class PatchManagerImport(Job):
                 continue
 
             if re.search(r"\brack\s+\d+\.\d+\b", normalized):
+                return part
+
+            if re.search(r"\brack\s+[a-z0-9-]+\.\d+[a-z]?\b", normalized):
                 return part
 
         # Cabinet 0316 / Cabinet 001 are authoritative rack identifiers.
@@ -505,9 +523,8 @@ class PatchManagerImport(Job):
         result = re.sub(r"\s+", " ", result).strip()
         return result
 
-    @staticmethod
-    def normalize_imported_rack_name_part(value: str) -> str:
-        normalized = (value or "").replace("<COMMA>", ",").strip()
+    def normalize_imported_rack_name_part(self, value: str) -> str:
+        normalized = self.strip_pm_inline_markup(value)
 
         normalized = re.sub(
             r"\bpanel\s+\d+\b",
@@ -2057,6 +2074,11 @@ class PatchManagerImport(Job):
             keys.add(number_token)
             keys.add(f"rack {number_token}")
 
+        # Alphanumeric rack aliases, e.g. Rack 921-C-1.7B.
+        for alnum_rack_match in re.finditer(r"\brack\s+([a-z0-9-]+\.\d+[a-z]?)\b", normalized):
+            keys.add(alnum_rack_match.group(1))
+            keys.add(f"rack {alnum_rack_match.group(1)}")
+
         # Cabinet aliases, anywhere in the name/token.
         for cabinet_match in re.finditer(r"\bcabinet\s+([a-z0-9-]+)\b", normalized):
             keys.add(f"cabinet {cabinet_match.group(1)}")
@@ -2264,7 +2286,7 @@ class PatchManagerImport(Job):
         Return possible Nautobot rack names from a Patch Manager rack identifier.
         '<COMMA>' is an escaped comma inside a single Patch Manager field.
         """
-        raw = self.clean(value)
+        raw = self.strip_pm_inline_markup(self.clean(value))
         unescaped = raw.replace("<COMMA>", ",")
 
         candidates = [
@@ -2279,6 +2301,11 @@ class PatchManagerImport(Job):
         rack_match = re.search(r"\brack\s+(\d+)\.0*(\d+)\b", unescaped, re.IGNORECASE)
         if rack_match:
             candidates.append(f"Rack {rack_match.group(1)}.{int(rack_match.group(2))}")
+
+        alnum_rack_match = re.search(r"\brack\s+([A-Za-z0-9-]+\.\d+[A-Za-z]?)\b", unescaped, re.IGNORECASE)
+        if alnum_rack_match:
+            candidates.append(f"Rack {alnum_rack_match.group(1)}")
+            candidates.append(alnum_rack_match.group(1))
 
         cabinet_match = re.search(r"\bcabinet\s+([a-z0-9-]+)\b", unescaped, re.IGNORECASE)
         if cabinet_match:
@@ -2708,6 +2735,9 @@ class PatchManagerImport(Job):
             return False
 
         if re.search(r"\brack\s+\d+\.\d+\b", normalized):
+            return True
+
+        if re.search(r"\brack\s+[a-z0-9-]+\.\d+[a-z]?\b", normalized):
             return True
 
         if re.search(r"^\d+\.\d+\b", normalized):
