@@ -748,9 +748,6 @@ class PatchManagerImport(Job):
                 target_device = self.find_imported_device_in_identifier(identifier)
 
             if not target_device:
-                target_device = self.find_parent_device_for_module_or_numeric_row(row)
-
-            if not target_device:
                 target_device = self.get_or_create_passive_infrastructure_device_for_row(row)
 
             if not target_device:
@@ -812,116 +809,6 @@ class PatchManagerImport(Job):
             device = Device.objects.get(pk=device_id)
             self.replace_pm_port_details_note(device, detail_rows)
             self.logger.info("Updated Patch Manager port details note on device %s", device.name)
-
-    def find_parent_device_for_module_or_numeric_row(
-        self,
-        row: Dict[str, Any],
-    ) -> Optional[Device]:
-        """
-        Resolve module/subcomponent and generic numeric child rows to their
-        parent mounted device so their PM details can go into a device Note.
-        """
-        identifier = self.clean(row.get(self.fields["device_identifier"]))
-        if not identifier:
-            return None
-
-        identifier_parts = self.split_equipment_identifier_for_matching(identifier)
-        if not identifier_parts:
-            return None
-
-        equipment_label = self.clean(row.get(self.fields["device_name"]))
-        equipment_template = self.clean(row.get(self.fields["device_type"]))
-
-        if not (
-            self.is_module_or_subcomponent_label(equipment_label)
-            or self.is_generic_numeric_or_directional_label(equipment_label)
-            or self.is_module_or_subcomponent_template(equipment_template)
-        ):
-            return None
-
-        matched_racks = self.find_racks_in_identifier(identifier_parts)
-
-        parent_device = self.find_parent_device_by_right_to_left_scan(
-            identifier_parts=identifier_parts,
-            matched_racks=matched_racks,
-        )
-
-        if parent_device:
-            self.logger.info(
-                "Matched module/numeric child row to parent device %s: label=%r identifier=%r",
-                parent_device.name,
-                equipment_label,
-                identifier,
-            )
-
-        return parent_device
-
-    @staticmethod
-    def is_module_or_subcomponent_label(value: str) -> bool:
-        token = re.sub(r"\s+", " ", (value or "").strip().lower())
-
-        if not token:
-            return False
-
-        patterns = (
-            r"^lc\d+$",
-            r"^scu$",
-            r"^ncu$",
-            r"^mic",
-            r"^mpa",
-            r"^pic",
-            r"^fan\s*\d*$",
-            r"^power\s*\d*$",
-            r"^psu\s*\d*$",
-            r"^pem\s*\d*$",
-            r"^slot\s*\d+$",
-            r"^module\s*\d+$",
-        )
-
-        return any(re.match(pattern, token) for pattern in patterns)
-
-    @staticmethod
-    def is_module_or_subcomponent_template(value: str) -> bool:
-        token = re.sub(r"\s+", " ", (value or "").strip().lower())
-
-        if not token:
-            return False
-
-        keywords = (
-            "line card",
-            "linecard",
-            "routing engine",
-            "supervisor",
-            "fan",
-            "power",
-            "psu",
-            "pem",
-            "mic",
-            "mpa",
-            "pic",
-            "scu",
-            "ncu",
-        )
-
-        return any(keyword in token for keyword in keywords)
-
-    @staticmethod
-    def is_generic_numeric_or_directional_label(value: str) -> bool:
-        token = re.sub(r"\s+", " ", (value or "").strip().lower())
-
-        if not token:
-            return False
-
-        if re.match(r"^\d+(,\d+)*$", token):
-            return True
-
-        if token in {"ne", "nw", "se", "sw", "tx", "rx"}:
-            return True
-
-        if re.match(r"^traffic\s*\d+$", token):
-            return True
-
-        return False
 
     def get_or_create_interface_for_child_row(
         self,
@@ -1805,6 +1692,9 @@ class PatchManagerImport(Job):
     def replace_pm_port_details_note(self, device: Device, detail_rows: List[Dict[str, str]]) -> None:
         """
         Create/update a single Patch Manager sync Note assigned to this device.
+
+        This is intentionally the only behavior change from the low-virtual
+        baseline: PM detail blocks go to Notes instead of Device.comments.
         """
         note_body = self.render_pm_port_details_note_body(detail_rows)
         content_type = ContentType.objects.get_for_model(Device)
@@ -2589,104 +2479,24 @@ class PatchManagerImport(Job):
 
         return False
 
-    def build_strict_canonical_virtual_rack_name(
-        self,
-        identifier_parts: List[str],
-    ) -> str:
-        """
-        Strict single source of truth for virtual rack names.
-
-        This intentionally collapses provider/panel/MMR variants into one
-        canonical room/suite/DC/cage bucket before any Rack.update_or_create().
-        """
-        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
-        if not parts:
-            return ""
-
-        for part in parts:
-            if self.looks_like_real_rack_reference(part):
-                return ""
-
-        site_name = self.get_rack_name_prefix_from_identifier(parts)
-        if not site_name:
-            return ""
-
-        context_text = " ".join(parts[1:])
-        normalized_context = self.normalize_pm_match_text(context_text)
-
-        # Suite always wins. This collapses Suite 804 MMR, DRT - Suite 804,
-        # Crown Castle Suite 804, Non NYSERNet Panels in Suite 804, etc.
-        suite = self.extract_suite_token(context_text)
-        if suite:
-            return self.safe_nautobot_name(f"{VIRTUAL_RACK_PREFIX} {site_name} {suite}")
-
-        # Stable cage/DC/MMR/room buckets when no suite exists.
-        if "nysernet cage" in normalized_context or "nysenet cage" in normalized_context:
-            return self.safe_nautobot_name(f"{VIRTUAL_RACK_PREFIX} {site_name} NYSERNet Cage")
-
-        dc_match = re.search(r"\bdc\s+(north|south|east|west)\b", context_text, re.IGNORECASE)
-        if dc_match:
-            return self.safe_nautobot_name(f"{VIRTUAL_RACK_PREFIX} {site_name} DC {dc_match.group(1).capitalize()}")
-
-        if re.search(r"\b(mmr|meet\s+me\s+room)\b", context_text, re.IGNORECASE):
-            return self.safe_nautobot_name(f"{VIRTUAL_RACK_PREFIX} {site_name} MMR")
-
-        if "telco room" in normalized_context:
-            return self.safe_nautobot_name(f"{VIRTUAL_RACK_PREFIX} {site_name} Telco Room")
-
-        if "danc" in normalized_context:
-            return self.safe_nautobot_name(f"{VIRTUAL_RACK_PREFIX} {site_name} DANC")
-
-        # Last resort: use the existing canonical bucket function, but do not
-        # allow provider/panel-only strings to become their own rack buckets.
-        bucket = self.build_virtual_rack_bucket_from_identifier(parts)
-        normalized_bucket = self.normalize_pm_match_text(bucket)
-
-        provider_or_panel_terms = (
-            "crown castle",
-            "centurylink",
-            "non nysernet panel",
-            "panel",
-            "panels",
-            "fdp",
-            "fiber",
-            "bulkhead",
-            "commscope",
-            "telect",
-        )
-
-        if normalized_bucket and not any(term in normalized_bucket for term in provider_or_panel_terms):
-            return self.normalize_virtual_rack_name(site_name, bucket)
-
-        return ""
-
-    def find_existing_virtual_rack_by_canonical_name(self, virtual_rack_name: str) -> Optional[Rack]:
-        if not virtual_rack_name:
-            return None
-
-        rack = Rack.objects.filter(name=virtual_rack_name).first()
-        if rack:
-            return rack
-
-        # Defensive lookup: if older runs created provider-fragmented names,
-        # prefer the canonical rack if one exists with the same normalized key.
-        normalized_target = self.normalize_pm_match_text(virtual_rack_name)
-        for existing_rack in Rack.objects.filter(name__startswith=f"{VIRTUAL_RACK_PREFIX} "):
-            if self.normalize_pm_match_text(existing_rack.name) == normalized_target:
-                return existing_rack
-
-        return None
-
     def get_or_create_virtual_rack_from_identifier_parts(
         self,
         identifier_parts: List[str],
         location: Optional[Location] = None,
     ) -> Optional[Rack]:
         """
-        Create/update a virtual rack only using strict canonical naming.
+        Create a clearly marked virtual rack for unresolved non-rack infrastructure
+        buckets or location buckets.
 
-        This prevents new virtual racks from being created for provider/panel
-        variants that should collapse into the same suite/MMR/DC/cage bucket.
+        These are normal Nautobot Rack objects, but they are intentionally named
+        with the "Virtual" prefix so they are distinguishable from physical
+        cabinets.
+
+        Examples:
+        - Virtual New York City - PoP DRT - Suite 804 Meet Me Room Non NYSERNet Panels
+        - Virtual Syracuse datacenter DC North
+        - Virtual 32 AoA DRT MMR Non NYSERNet Panels
+        - Virtual Albany - PoP Suite 510 - CenturyLink
         """
         if not identifier_parts:
             return None
@@ -2695,36 +2505,35 @@ class PatchManagerImport(Job):
         if not parts:
             return None
 
-        virtual_rack_name = self.build_strict_canonical_virtual_rack_name(parts)
+        # If a real rack/cabinet-looking value exists anywhere in the identifier,
+        # do not create a virtual rack. The real rack normalizer should handle it.
+        for part in parts:
+            if self.looks_like_real_rack_reference(part):
+                return None
+
+        site_name = self.get_rack_name_prefix_from_identifier(parts)
+        virtual_bucket = self.build_virtual_rack_bucket_from_identifier(parts)
+
+        if not site_name or not virtual_bucket:
+            return None
+
+        virtual_rack_name = self.normalize_virtual_rack_name(site_name, virtual_bucket)
+
         if not virtual_rack_name:
             return None
 
-        site_name = self.get_rack_name_prefix_from_identifier(parts)
         rack_location = location or self.get_or_create_location(site_name)
         status = self.get_status()
 
-        existing_rack = self.find_existing_virtual_rack_by_canonical_name(virtual_rack_name)
-
-        if existing_rack:
-            rack = existing_rack
-            created = False
-            Rack.objects.filter(pk=rack.pk).update(
-                location=rack_location,
-                status=status,
-                u_height=DEFAULT_RACK_HEIGHT,
-                comments="Virtual rack created by Patch Manager import for non-rack infrastructure/location grouping.",
-            )
-            rack.refresh_from_db()
-        else:
-            rack, created = Rack.objects.update_or_create(
-                name=virtual_rack_name,
-                location=rack_location,
-                defaults={
-                    "status": status,
-                    "u_height": DEFAULT_RACK_HEIGHT,
-                    "comments": "Virtual rack created by Patch Manager import for non-rack infrastructure/location grouping.",
-                },
-            )
+        rack, created = Rack.objects.update_or_create(
+            name=virtual_rack_name,
+            location=rack_location,
+            defaults={
+                "status": status,
+                "u_height": DEFAULT_RACK_HEIGHT,
+                "comments": "Virtual rack created by Patch Manager import for non-rack infrastructure/location grouping.",
+            },
+        )
 
         self.add_rack_to_lookup_cache(rack)
 
