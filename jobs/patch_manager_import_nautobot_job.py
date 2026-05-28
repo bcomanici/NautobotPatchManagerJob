@@ -1200,6 +1200,10 @@ class PatchManagerImport(Job):
         if rack:
             return rack
 
+        rack = self.find_passive_panel_rack_from_explicit_aliases(identifier_parts)
+        if rack:
+            return rack
+
         matched_racks = self.find_racks_in_identifier(identifier_parts)
         if len(matched_racks) == 1:
             return matched_racks[0]
@@ -1230,6 +1234,92 @@ class PatchManagerImport(Job):
             return parent_device.rack
 
         return self.find_existing_rack_by_location_context(identifier_parts, location)
+
+    def find_passive_panel_rack_from_explicit_aliases(
+        self,
+        identifier_parts: List[str],
+    ) -> Optional[Rack]:
+        """
+        Resolve passive panel rows from explicit panel-style rack aliases.
+
+        Patch Manager often records passive fiber objects as labels such as
+        "Rack 101.02 Panel 2". The imported Nautobot rack is "Rack 101.02"
+        or a location-qualified equivalent, so strip only the explicit panel/LGX
+        tail and feed the resulting rack alias through the normal rack matcher.
+
+        This is intentionally conservative: it only derives aliases when the
+        source token already contains an explicit Rack + decimal rack number.
+        It never creates virtual racks.
+        """
+        aliases: List[str] = []
+
+        for part in identifier_parts:
+            for alias in self.extract_passive_panel_explicit_rack_aliases(part):
+                if alias not in aliases:
+                    aliases.append(alias)
+
+        if not aliases:
+            return None
+
+        candidates: List[Rack] = []
+        lookup_context = list(identifier_parts) + aliases
+
+        for alias in aliases:
+            rack = self.find_rack_with_context(alias, lookup_context)
+            if rack and rack not in candidates:
+                candidates.append(rack)
+
+        if not candidates:
+            return None
+
+        if len(candidates) == 1:
+            self.logger.info(
+                "Resolved passive patch panel rack from explicit panel alias: alias=%s rack=%s",
+                aliases[0],
+                candidates[0].name,
+            )
+            return candidates[0]
+
+        rack = self.choose_best_rack_candidate(candidates, lookup_context) or candidates[0]
+        self.logger.info(
+            "Resolved passive patch panel rack from explicit panel aliases: aliases=%s rack=%s candidates=%s",
+            aliases,
+            rack.name,
+            [candidate.name for candidate in candidates],
+        )
+        return rack
+
+    @staticmethod
+    def extract_passive_panel_explicit_rack_aliases(value: str) -> List[str]:
+        """
+        Extract safe rack aliases from explicit passive-panel labels.
+
+        Examples:
+        - Rack 101.02 Panel 2 -> Rack 101.02
+        - Rack 101.04 LGX181 -> Rack 101.04
+        - Rack 101.02 FPP#7/01 -> Rack 101.02
+
+        Numeric-only labels or generic "Panel 2" strings intentionally do not
+        produce aliases because they lack an embedded rack identity.
+        """
+        text = re.sub(r"\s+", " ", (value or "").replace("<COMMA>", ",").strip())
+        if not text:
+            return []
+
+        aliases: List[str] = []
+
+        explicit_patterns = (
+            r"\brack\s+(\d+)\.0*(\d+)\b\s+(?:panel|lgx|fpp|fdp|fiber|patch)\b",
+            r"\brack\s+(\d+)\.0*(\d+)\b\s*[-_/]*\s*(?:panel|lgx|fpp|fdp)\b",
+        )
+
+        for pattern in explicit_patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                alias = f"Rack {match.group(1)}.{int(match.group(2))}"
+                if alias not in aliases:
+                    aliases.append(alias)
+
+        return aliases
 
     def find_existing_rack_by_location_context(
         self,
