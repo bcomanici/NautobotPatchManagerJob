@@ -2589,6 +2589,32 @@ class PatchManagerImport(Job):
 
         return False
 
+    def build_canonical_virtual_rack_name_from_identifier_parts(
+        self,
+        identifier_parts: List[str],
+    ) -> str:
+        """
+        Single source of truth for virtual rack names.
+
+        Any synthetic rack must be named by this helper so provider/panel/MMR
+        variants collapse consistently into canonical suite/cage/DC buckets.
+        """
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+        if not parts:
+            return ""
+
+        for part in parts:
+            if self.looks_like_real_rack_reference(part):
+                return ""
+
+        site_name = self.get_rack_name_prefix_from_identifier(parts)
+        virtual_bucket = self.build_virtual_rack_bucket_from_identifier(parts)
+
+        if not site_name or not virtual_bucket:
+            return ""
+
+        return self.normalize_virtual_rack_name(site_name, virtual_bucket)
+
     def get_or_create_virtual_rack_from_identifier_parts(
         self,
         identifier_parts: List[str],
@@ -2598,15 +2624,8 @@ class PatchManagerImport(Job):
         Create a clearly marked virtual rack for unresolved non-rack infrastructure
         buckets or location buckets.
 
-        These are normal Nautobot Rack objects, but they are intentionally named
-        with the "Virtual" prefix so they are distinguishable from physical
-        cabinets.
-
-        Examples:
-        - Virtual New York City - PoP DRT - Suite 804 Meet Me Room Non NYSERNet Panels
-        - Virtual Syracuse datacenter DC North
-        - Virtual 32 AoA DRT MMR Non NYSERNet Panels
-        - Virtual Albany - PoP Suite 510 - CenturyLink
+        All virtual rack names must come from
+        build_canonical_virtual_rack_name_from_identifier_parts().
         """
         if not identifier_parts:
             return None
@@ -2615,23 +2634,12 @@ class PatchManagerImport(Job):
         if not parts:
             return None
 
-        # If a real rack/cabinet-looking value exists anywhere in the identifier,
-        # do not create a virtual rack. The real rack normalizer should handle it.
-        for part in parts:
-            if self.looks_like_real_rack_reference(part):
-                return None
-
-        site_name = self.get_rack_name_prefix_from_identifier(parts)
-        virtual_bucket = self.build_virtual_rack_bucket_from_identifier(parts)
-
-        if not site_name or not virtual_bucket:
-            return None
-
-        virtual_rack_name = self.normalize_virtual_rack_name(site_name, virtual_bucket)
+        virtual_rack_name = self.build_canonical_virtual_rack_name_from_identifier_parts(parts)
 
         if not virtual_rack_name:
             return None
 
+        site_name = self.get_rack_name_prefix_from_identifier(parts)
         rack_location = location or self.get_or_create_location(site_name)
         status = self.get_status()
 
@@ -2646,6 +2654,7 @@ class PatchManagerImport(Job):
         )
 
         self.add_rack_to_lookup_cache(rack)
+        self.log_virtual_rack_canonicalization_audit(rack.name)
 
         self.logger.info(
             "%s virtual rack %s for unresolved Patch Manager infrastructure/location bucket",
@@ -2869,6 +2878,18 @@ class PatchManagerImport(Job):
         if not site or not bucket:
             return ""
 
+        # Defensive canonicalization: strip provider/panel suffixes when a suite
+        # token exists even if a caller accidentally passed a raw bucket.
+        suite_match = re.search(r"\bsuite\s*([a-z0-9-]+)\b", bucket, re.IGNORECASE)
+        if suite_match:
+            bucket = f"Suite {suite_match.group(1).upper()}"
+        else:
+            if re.search(r"\b(mmr|meet\s+me\s+room)\b", bucket, re.IGNORECASE):
+                bucket = "MMR"
+            dc_match = re.search(r"\bdc\s+(north|south|east|west)\b", bucket, re.IGNORECASE)
+            if dc_match:
+                bucket = f"DC {dc_match.group(1).capitalize()}"
+
         if bucket.lower().startswith(site.lower()):
             base_name = bucket
         else:
@@ -2876,6 +2897,8 @@ class PatchManagerImport(Job):
 
         if not base_name.lower().startswith(VIRTUAL_RACK_PREFIX.lower() + " "):
             base_name = f"{VIRTUAL_RACK_PREFIX} {base_name}"
+
+        base_name = re.sub(r"\s+", " ", base_name).strip()
 
         if len(base_name) > MAX_NAUTOBOT_NAME_LENGTH:
             return base_name[:MAX_NAUTOBOT_NAME_LENGTH].rstrip()
@@ -2943,6 +2966,20 @@ class PatchManagerImport(Job):
                 return part.strip()
 
         return ""
+
+    def log_virtual_rack_canonicalization_audit(self, rack_name: str) -> None:
+        normalized = self.normalize_pm_match_text(rack_name)
+        suspect_terms = (
+            "crown castle",
+            "centurylink",
+            "non nysernet panel",
+            "meet me room",
+        )
+        if rack_name.startswith(f"{VIRTUAL_RACK_PREFIX} ") and any(term in normalized for term in suspect_terms):
+            self.logger.info(
+                "Virtual rack retained provider/panel context after canonicalization: %s",
+                rack_name,
+            )
 
     def get_or_create_location(self, qname: str, physical_address: str = "") -> Location:
         parts = [p.strip() for p in qname.split(",") if p.strip()]
