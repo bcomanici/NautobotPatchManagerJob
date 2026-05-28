@@ -56,6 +56,12 @@ DEFAULT_STATUS_NAME = "Active"
 DEFAULT_DEVICE_ROLE_NAME = "Patch Manager Imported"
 DEFAULT_PASSIVE_ROLE_NAME = "Patch Manager Passive Infrastructure"
 DEFAULT_PASSIVE_MANUFACTURER_NAME = "Generic"
+DEFAULT_PASSIVE_PATCH_PANEL_ROLE_NAME = "Patch Manager Passive Patch Panel"
+PASSIVE_PATCH_PANEL_TEMPLATES = {
+    "generic fiber panel 1u - 2 slot",
+    "generic fiber 6 sc duplex sm",
+    "generic fiber 6 lc duplex sm",
+}
 DEFAULT_RACK_HEIGHT = 45
 MAX_NAUTOBOT_NAME_LENGTH = 255
 MAX_INTERFACE_NAME_LENGTH = 255
@@ -767,6 +773,9 @@ class PatchManagerImport(Job):
                 target_device = self.find_imported_device_in_identifier(identifier)
 
             if not target_device:
+                target_device = self.get_or_create_passive_patch_panel_device_for_row(row)
+
+            if not target_device:
                 target_device = self.get_or_create_passive_infrastructure_device_for_row(row)
 
             if not target_device:
@@ -1101,6 +1110,137 @@ class PatchManagerImport(Job):
             return name
 
         return name[:MAX_NAUTOBOT_NAME_LENGTH].rstrip()
+
+    def get_or_create_passive_patch_panel_device_for_row(
+        self,
+        row: Dict[str, Any],
+    ) -> Optional[Device]:
+        """
+        Promote a narrow set of known passive Patch Manager templates into
+        rack-mounted Nautobot devices, then let the normal skipped-row Note
+        path append row details to the device. This path deliberately requires
+        a real rack match and never creates virtual racks.
+        """
+        equipment_template = self.clean(row.get(self.fields["device_type"]))
+        if not self.is_passive_patch_panel_template(equipment_template):
+            return None
+
+        identifier = self.clean(row.get(self.fields["device_identifier"]))
+        if not identifier:
+            return None
+
+        identifier_data = self.parse_equipment_identifier(identifier)
+        identifier_parts = identifier_data.get("identifier_parts", [])
+
+        location = self.get_or_create_location(
+            identifier_data.get("location") or "Patch Manager",
+            identifier_data.get("address") or "",
+        )
+
+        rack = self.find_existing_rack_from_names(identifier_parts)
+        if not rack:
+            self.logger.warning(
+                "Passive patch panel row could not resolve a real rack; leaving unmatched. "
+                "template=%r identifier=%r",
+                equipment_template,
+                identifier,
+            )
+            return None
+
+        device_name = self.build_passive_patch_panel_device_name(
+            row=row,
+            rack=rack,
+            equipment_template=equipment_template,
+        )
+        device_type = self.get_or_create_passive_device_type(equipment_template)
+        role = self.get_or_create_device_role(DEFAULT_PASSIVE_PATCH_PANEL_ROLE_NAME)
+        status = self.get_status()
+
+        base_defaults = {
+            "device_type": device_type,
+            "role": role,
+            "status": status,
+            "location": rack.location,
+            "rack": rack,
+            "comments": (
+                "Passive patch panel device created by Patch Manager import from "
+                f"template: {equipment_template}"
+            ),
+        }
+
+        return self.create_or_update_passive_device_in_first_valid_u(
+            device_name=device_name,
+            rack=rack,
+            base_defaults=base_defaults,
+        )
+
+    def find_existing_rack_from_names(self, rack_names: List[str]) -> Optional[Rack]:
+        """
+        Resolve only already-imported racks. Unlike find_rack_from_names(), this
+        intentionally does not fall back to virtual rack creation.
+        """
+        for rack_name in rack_names:
+            rack = self.find_rack_with_context(rack_name, rack_names)
+            if rack:
+                return rack
+
+        return None
+
+    @staticmethod
+    def is_passive_patch_panel_template(value: str) -> bool:
+        normalized = re.sub(r"\s+", " ", (value or "").strip().lower())
+        return normalized in PASSIVE_PATCH_PANEL_TEMPLATES
+
+    def build_passive_patch_panel_device_name(
+        self,
+        row: Dict[str, Any],
+        rack: Rack,
+        equipment_template: str,
+    ) -> str:
+        label = self.clean(row.get(self.fields["device_name"]))
+        identifier = self.clean(row.get(self.fields["device_identifier"]))
+        identifier_parts = self.split_equipment_identifier_for_matching(identifier)
+
+        name_parts = [rack.name, equipment_template]
+
+        if label and self.normalize_pm_match_text(label) != self.normalize_pm_match_text(equipment_template):
+            name_parts.append(label)
+        else:
+            meaningful_tail = self.find_passive_patch_panel_identifier_tail(identifier_parts, equipment_template)
+            if meaningful_tail:
+                name_parts.append(meaningful_tail)
+
+        return self.safe_nautobot_name(" - ".join(part for part in name_parts if part))
+
+    def find_passive_patch_panel_identifier_tail(
+        self,
+        identifier_parts: List[str],
+        equipment_template: str,
+    ) -> str:
+        normalized_template = self.normalize_pm_match_text(equipment_template)
+
+        for part in reversed(identifier_parts):
+            clean_part = self.clean(part).replace("<COMMA>", ",")
+            normalized_part = self.normalize_pm_match_text(clean_part)
+
+            if not normalized_part:
+                continue
+
+            if normalized_part == normalized_template:
+                continue
+
+            if normalized_part in IGNORED_RACK_LOOKUP_TOKENS:
+                continue
+
+            if self.looks_like_real_rack_reference(clean_part):
+                continue
+
+            if self.find_rack_candidates(clean_part):
+                continue
+
+            return clean_part
+
+        return ""
 
     def get_or_create_passive_infrastructure_device_for_row(
         self,
