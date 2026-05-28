@@ -1237,6 +1237,10 @@ class PatchManagerImport(Job):
         if rack:
             return rack
 
+        rack = self.find_single_real_rack_for_site_context(identifier_parts, location)
+        if rack:
+            return rack
+
         return self.get_or_create_passive_panel_coordinate_rack(identifier_parts, location)
 
     def get_or_create_passive_panel_coordinate_rack(
@@ -1488,6 +1492,88 @@ class PatchManagerImport(Job):
 
         return aliases
 
+    @staticmethod
+    def is_imported_virtual_rack(rack: Rack) -> bool:
+        comments = re.sub(r"\s+", " ", getattr(rack, "comments", "") or "").strip().lower()
+        return comments.startswith("virtual rack created by patch manager import")
+
+    def get_real_racks_for_location(self, location: Location) -> List[Rack]:
+        racks: List[Rack] = []
+
+        for rack in Rack.objects.filter(location=location):
+            if self.is_imported_virtual_rack(rack):
+                continue
+            racks.append(rack)
+
+        return racks
+
+    def find_single_real_rack_for_site_context(
+        self,
+        identifier_parts: List[str],
+        location: Optional[Location],
+    ) -> Optional[Rack]:
+        """
+        Final conservative fallback for passive panel rows where the PM export
+        identifies a site/customer but omits a rack token.
+
+        Use exactly one non-virtual imported rack for the site. If more than one
+        real rack is plausible, do not guess.
+        """
+        site_tokens: List[str] = []
+
+        if location and location.name:
+            site_tokens.append(location.name)
+
+        prefix = self.get_rack_name_prefix_from_identifier(identifier_parts)
+        if prefix:
+            site_tokens.append(prefix)
+
+        if len(identifier_parts) > 1 and self.clean(identifier_parts[1]):
+            site_tokens.append(self.clean(identifier_parts[1]).replace("<COMMA>", ","))
+
+        normalized_site_tokens: List[str] = []
+        for token in site_tokens:
+            normalized = self.normalize_pm_match_text(token)
+            if normalized and normalized not in normalized_site_tokens:
+                normalized_site_tokens.append(normalized)
+
+        if not normalized_site_tokens:
+            return None
+
+        candidate_racks: List[Rack] = []
+        seen_ids = set()
+
+        for rack in Rack.objects.select_related("location").all():
+            if self.is_imported_virtual_rack(rack):
+                continue
+
+            rack_name = self.normalize_pm_match_text(rack.name)
+            rack_location = self.normalize_pm_match_text(rack.location.name) if getattr(rack, "location", None) else ""
+
+            for site_token in normalized_site_tokens:
+                if rack_location == site_token or rack_name.startswith(f"{site_token} "):
+                    if rack.pk not in seen_ids:
+                        seen_ids.add(rack.pk)
+                        candidate_racks.append(rack)
+                    break
+
+        if len(candidate_racks) != 1:
+            if len(candidate_racks) > 1:
+                self.logger.info(
+                    "Skipped site-single-rack fallback because multiple real racks matched site context: sites=%s racks=%s",
+                    normalized_site_tokens,
+                    [rack.name for rack in candidate_racks],
+                )
+            return None
+
+        rack = candidate_racks[0]
+        self.logger.info(
+            "Resolved passive patch panel rack by site-single-rack fallback: sites=%s rack=%s",
+            normalized_site_tokens,
+            rack.name,
+        )
+        return rack
+
     def find_existing_rack_by_location_context(
         self,
         identifier_parts: List[str],
@@ -1502,7 +1588,7 @@ class PatchManagerImport(Job):
         if not location:
             return None
 
-        location_racks = list(Rack.objects.filter(location=location))
+        location_racks = self.get_real_racks_for_location(location)
         if not location_racks:
             return None
 
