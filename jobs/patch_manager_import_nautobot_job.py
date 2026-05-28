@@ -1233,7 +1233,11 @@ class PatchManagerImport(Job):
             )
             return parent_device.rack
 
-        return self.find_existing_rack_by_location_context(identifier_parts, location)
+        rack = self.find_existing_rack_by_location_context(identifier_parts, location)
+        if rack:
+            return rack
+
+        return self.get_or_create_passive_panel_coordinate_rack(identifier_parts, location)
 
     def find_passive_panel_rack_from_explicit_aliases(
         self,
@@ -1330,6 +1334,15 @@ class PatchManagerImport(Job):
         if re.match(r"^rack\s*[:;]", text, flags=re.IGNORECASE):
             if "Rack" not in aliases:
                 aliases.append("Rack")
+
+        for cf_alias in PatchManagerImport.extract_cf_rack_coordinate_aliases(text):
+            if cf_alias not in aliases:
+                aliases.append(cf_alias)
+
+        for coord in PatchManagerImport.extract_passive_panel_coordinate_tokens(text):
+            for alias in (coord, f"Rack - {coord}"):
+                if alias not in aliases:
+                    aliases.append(alias)
 
         return aliases
 
@@ -2410,6 +2423,13 @@ class PatchManagerImport(Job):
         for embedded_decimal in re.finditer(r"\b(\d+\.\d+\b[^,]*)", normalized):
             keys.add(embedded_decimal.group(1).strip())
 
+        for cf_alias in self.extract_cf_rack_coordinate_aliases(normalized):
+            keys.add(self.normalize_pm_match_text(cf_alias))
+
+        for coord in self.extract_passive_panel_coordinate_tokens(normalized):
+            keys.add(self.normalize_pm_match_text(coord))
+            keys.add(self.normalize_pm_match_text(f"Rack - {coord}"))
+
         return {key for key in keys if key}
 
     def should_attempt_rack_lookup(self, value: str) -> bool:
@@ -2632,6 +2652,14 @@ class PatchManagerImport(Job):
         decimal_match = re.search(r"^(\d+\.\d+\b.*)$", unescaped)
         if decimal_match:
             candidates.append(decimal_match.group(1).strip())
+
+        for candidate in list(candidates):
+            for cf_alias in self.extract_cf_rack_coordinate_aliases(candidate):
+                candidates.append(cf_alias)
+
+            for coord in self.extract_passive_panel_coordinate_tokens(candidate):
+                candidates.append(coord)
+                candidates.append(f"Rack - {coord}")
 
         expanded_candidates: List[str] = []
         for candidate in candidates:
@@ -3122,6 +3150,12 @@ class PatchManagerImport(Job):
             return True
 
         if re.search(r"^\d+\.\d+\b", normalized):
+            return True
+
+        if PatchManagerImport.extract_passive_panel_coordinate_tokens(normalized):
+            return True
+
+        if PatchManagerImport.extract_cf_rack_coordinate_aliases(normalized):
             return True
 
         return False
