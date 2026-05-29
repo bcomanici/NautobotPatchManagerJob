@@ -1241,7 +1241,109 @@ class PatchManagerImport(Job):
         if rack:
             return rack
 
+        rack = self.get_or_create_loop_cage_panel_virtual_rack(identifier_parts, location)
+        if rack:
+            return rack
+
         return self.get_or_create_passive_panel_coordinate_rack(identifier_parts, location)
+
+    def get_or_create_loop_cage_panel_virtual_rack(
+        self,
+        identifier_parts: List[str],
+        location: Optional[Location],
+    ) -> Optional[Rack]:
+        """
+        Create a controlled logical rack for dark-fiber / customer loop rows
+        whose PM hierarchy identifies a Loop plus a Cage/Panel area but has no
+        resolvable physical rack.
+
+        Example:
+            NYC Dark Fiber, New York University, NYU Loop 20, ...,
+            NYSERNet Cage, 2405.01.04 FR-0010, 1, 1
+        becomes rack:
+            New York University NYU Loop 20 Virtual Rack
+        and the passive device name is handled separately as:
+            NYSERNet Cage, 2405.01.04 FR-0010, 1, 1
+        """
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+        if not self.is_loop_cage_panel_identifier(parts):
+            return None
+
+        customer = self.get_loop_customer_name(parts)
+        loop_name = self.get_loop_name(parts)
+
+        if not customer or not loop_name:
+            return None
+
+        rack_name = self.safe_nautobot_name(
+            re.sub(r"\s+", " ", f"{customer} {loop_name} Virtual Rack").strip()
+        )
+
+        rack_location = location or self.get_or_create_location(customer)
+        status = self.get_status()
+
+        rack, created = Rack.objects.update_or_create(
+            name=rack_name,
+            location=rack_location,
+            defaults={
+                "status": status,
+                "u_height": DEFAULT_RACK_HEIGHT,
+                "comments": (
+                    "Virtual rack created by Patch Manager import for loop/cage/panel "
+                    "passive infrastructure grouping. This is a logical container, "
+                    "not a physical cabinet from the Cabinet export."
+                ),
+            },
+        )
+
+        self.add_rack_to_lookup_cache(rack)
+
+        self.logger.info(
+            "%s loop/cage/panel virtual rack %s from identifier parts=%s",
+            "Created" if created else "Updated",
+            rack.name,
+            parts,
+        )
+
+        return rack
+
+    def is_loop_cage_panel_identifier(self, parts: List[str]) -> bool:
+        if not parts:
+            return False
+
+        has_loop = bool(self.get_loop_name(parts))
+        has_cage_or_panel_tail = bool(self.build_loop_cage_panel_device_name_from_identifier(parts))
+
+        return has_loop and has_cage_or_panel_tail
+
+    @staticmethod
+    def get_loop_name(parts: List[str]) -> str:
+        for part in parts:
+            clean_part = re.sub(r"\s+", " ", (part or "").replace("<COMMA>", ",").strip())
+            if re.search(r"\bloop\s*\d+\b", clean_part, flags=re.IGNORECASE):
+                return clean_part
+        return ""
+
+    @staticmethod
+    def get_loop_customer_name(parts: List[str]) -> str:
+        if len(parts) > 1 and parts[1].strip():
+            return re.sub(r"\s+", " ", parts[1].replace("<COMMA>", ",").strip())
+        if parts:
+            return re.sub(r"\s+", " ", parts[0].replace("<COMMA>", ",").strip())
+        return ""
+
+    def build_loop_cage_panel_device_name_from_identifier(self, identifier_parts: List[str]) -> str:
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+
+        for index, part in enumerate(parts):
+            normalized = self.normalize_pm_match_text(part)
+            if re.search(r"\b(cage|panel|panels)\b", normalized):
+                tail = parts[index:]
+                tail = [re.sub(r"\s+", " ", item).strip() for item in tail if item.strip()]
+                if tail:
+                    return self.safe_nautobot_name(", ".join(tail))
+
+        return ""
 
     def get_or_create_passive_panel_coordinate_rack(
         self,
@@ -1663,6 +1765,10 @@ class PatchManagerImport(Job):
         label = self.clean(row.get(self.fields["device_name"]))
         identifier = self.clean(row.get(self.fields["device_identifier"]))
         identifier_parts = self.split_equipment_identifier_for_matching(identifier)
+
+        loop_cage_panel_name = self.build_loop_cage_panel_device_name_from_identifier(identifier_parts)
+        if loop_cage_panel_name and self.is_imported_virtual_rack(rack):
+            return loop_cage_panel_name
 
         name_parts = [rack.name, equipment_template]
 
