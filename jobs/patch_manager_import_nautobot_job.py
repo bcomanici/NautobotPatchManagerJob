@@ -1245,6 +1245,14 @@ class PatchManagerImport(Job):
         if rack:
             return rack
 
+        rack = self.get_or_create_buffalo_pop_panel_virtual_rack(identifier_parts, location)
+        if rack:
+            return rack
+
+        rack = self.find_existing_customer_location_rack_any(identifier_parts, location)
+        if rack:
+            return rack
+
         return self.get_or_create_passive_panel_coordinate_rack(identifier_parts, location)
 
     def get_or_create_loop_cage_panel_virtual_rack(
@@ -1342,6 +1350,111 @@ class PatchManagerImport(Job):
                 tail = [re.sub(r"\s+", " ", item).strip() for item in tail if item.strip()]
                 if tail:
                     return self.safe_nautobot_name(", ".join(tail))
+
+        return ""
+
+    def get_or_create_buffalo_pop_panel_virtual_rack(
+        self,
+        identifier_parts: List[str],
+        location: Optional[Location],
+    ) -> Optional[Rack]:
+        """
+        Create a controlled logical rack for remaining Buffalo PoP panel aliases
+        such as WS - 207 pnl1, WS - 207 pnl5, and WS - RR200.01 PNL 4.
+
+        These rows identify a PoP plus panel context, but not a physical rack
+        exported as a Cabinet. Keep this limited to Buffalo PoP panel-like rows
+        so it cannot become a broad fuzzy fallback.
+        """
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+        if not self.is_buffalo_pop_panel_identifier(parts):
+            return None
+
+        pop_name = self.get_buffalo_pop_name(parts)
+        context_name = self.get_buffalo_panel_context_name(parts)
+        if not pop_name or not context_name:
+            return None
+
+        rack_name = self.safe_nautobot_name(
+            re.sub(r"\s+", " ", f"{pop_name} {context_name} Panel Virtual Rack").strip()
+        )
+
+        rack_location = location or self.get_or_create_location(pop_name)
+        status = self.get_status()
+
+        rack, created = Rack.objects.update_or_create(
+            name=rack_name,
+            location=rack_location,
+            defaults={
+                "status": status,
+                "u_height": DEFAULT_RACK_HEIGHT,
+                "comments": (
+                    "Virtual rack created by Patch Manager import for Buffalo PoP "
+                    "passive panel aliases. This is a logical container, not a "
+                    "physical cabinet from the Cabinet export."
+                ),
+            },
+        )
+
+        self.add_rack_to_lookup_cache(rack)
+
+        self.logger.info(
+            "%s Buffalo PoP panel virtual rack %s from identifier parts=%s",
+            "Created" if created else "Updated",
+            rack.name,
+            parts,
+        )
+
+        return rack
+
+    def is_buffalo_pop_panel_identifier(self, parts: List[str]) -> bool:
+        if not parts:
+            return False
+
+        normalized_parts = [self.normalize_pm_match_text(part) for part in parts]
+        joined = " ".join(normalized_parts)
+
+        if "buffalo - pop" not in joined:
+            return False
+
+        if not any("meet me room" in part or "windstream pop" in part for part in normalized_parts):
+            return False
+
+        return bool(self.build_buffalo_pop_panel_device_name_from_identifier(parts))
+
+    @staticmethod
+    def get_buffalo_pop_name(parts: List[str]) -> str:
+        for part in parts:
+            clean_part = re.sub(r"\s+", " ", (part or "").replace("<COMMA>", ",").strip())
+            if clean_part.lower() == "buffalo - pop":
+                return clean_part
+        if len(parts) > 1 and parts[1].strip():
+            return re.sub(r"\s+", " ", parts[1].replace("<COMMA>", ",").strip())
+        return ""
+
+    def get_buffalo_panel_context_name(self, parts: List[str]) -> str:
+        for part in parts:
+            clean_part = re.sub(r"\s+", " ", (part or "").replace("<COMMA>", ",").strip())
+            normalized = self.normalize_pm_match_text(clean_part)
+            if "meet me room" in normalized or "windstream pop" in normalized:
+                return clean_part
+        return "Buffalo Passive Panels"
+
+    def build_buffalo_pop_panel_device_name_from_identifier(self, identifier_parts: List[str]) -> str:
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+
+        for part in reversed(parts):
+            clean_part = re.sub(r"\s+", " ", part).strip()
+            normalized = self.normalize_pm_match_text(clean_part)
+
+            if re.search(r"\b(pnl|panel)\b", normalized):
+                return self.safe_nautobot_name(clean_part)
+
+            if re.search(r"\brr\s*\d+\.\d+\b", normalized):
+                return self.safe_nautobot_name(clean_part)
+
+            if re.search(r"\bfpp[#\-]?\d", normalized):
+                return self.safe_nautobot_name(clean_part)
 
         return ""
 
@@ -1609,6 +1722,99 @@ class PatchManagerImport(Job):
 
         return racks
 
+    def find_existing_customer_location_rack_any(
+        self,
+        identifier_parts: List[str],
+        location: Optional[Location],
+    ) -> Optional[Rack]:
+        """
+        Terminal fallback for unresolved passive rows from Customer Locations.
+
+        At this point all stronger rack/device/coordinate/loop/panel matches have
+        failed. Some PM customer-location rows identify only a customer service
+        object such as "Vassar College Router" or "Yeshiva OSP FDP". If the
+        customer/site already has exactly one imported rack or logical rack, use
+        that existing container even when no rack identifier appears in the row.
+
+        This method does not create racks and refuses to choose among multiple
+        plausible containers.
+        """
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+        if not parts:
+            return None
+
+        if self.normalize_pm_match_text(parts[0]) != "customer locations":
+            return None
+
+        site_tokens: List[str] = []
+
+        if location and location.name:
+            site_tokens.append(location.name)
+
+        if len(parts) > 1 and parts[1].strip():
+            site_tokens.append(parts[1])
+
+        prefix = self.get_rack_name_prefix_from_identifier(parts)
+        if prefix:
+            site_tokens.append(prefix)
+
+        normalized_site_tokens: List[str] = []
+        for token in site_tokens:
+            normalized = self.normalize_pm_match_text(token)
+            if normalized and normalized not in normalized_site_tokens:
+                normalized_site_tokens.append(normalized)
+
+        if not normalized_site_tokens:
+            return None
+
+        candidate_racks: List[Rack] = []
+        seen_ids = set()
+
+        for rack in Rack.objects.select_related("location").all():
+            rack_name = self.normalize_pm_match_text(rack.name)
+            rack_location = self.normalize_pm_match_text(rack.location.name) if getattr(rack, "location", None) else ""
+
+            for site_token in normalized_site_tokens:
+                if (
+                    rack_location == site_token
+                    or rack_name == site_token
+                    or rack_name.startswith(f"{site_token} ")
+                ):
+                    if rack.pk not in seen_ids:
+                        seen_ids.add(rack.pk)
+                        candidate_racks.append(rack)
+                    break
+
+        if not candidate_racks:
+            return None
+
+        if len(candidate_racks) == 1:
+            rack = candidate_racks[0]
+            self.logger.info(
+                "Resolved passive patch panel rack by customer-location existing-rack fallback: sites=%s rack=%s",
+                normalized_site_tokens,
+                rack.name,
+            )
+            return rack
+
+        virtual_candidates = [rack for rack in candidate_racks if self.is_imported_virtual_rack(rack)]
+        if len(virtual_candidates) == 1:
+            rack = virtual_candidates[0]
+            self.logger.info(
+                "Resolved passive patch panel rack by customer-location virtual-rack fallback: sites=%s rack=%s candidates=%s",
+                normalized_site_tokens,
+                rack.name,
+                [candidate.name for candidate in candidate_racks],
+            )
+            return rack
+
+        self.logger.info(
+            "Skipped customer-location existing-rack fallback because multiple racks matched site context: sites=%s racks=%s",
+            normalized_site_tokens,
+            [rack.name for rack in candidate_racks],
+        )
+        return None
+
     def find_single_real_rack_for_site_context(
         self,
         identifier_parts: List[str],
@@ -1769,6 +1975,10 @@ class PatchManagerImport(Job):
         loop_cage_panel_name = self.build_loop_cage_panel_device_name_from_identifier(identifier_parts)
         if loop_cage_panel_name and self.is_imported_virtual_rack(rack):
             return loop_cage_panel_name
+
+        buffalo_panel_name = self.build_buffalo_pop_panel_device_name_from_identifier(identifier_parts)
+        if buffalo_panel_name and self.is_imported_virtual_rack(rack):
+            return buffalo_panel_name
 
         name_parts = [rack.name, equipment_template]
 
