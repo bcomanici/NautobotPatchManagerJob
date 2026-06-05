@@ -228,6 +228,7 @@ class PatchManagerImport(Job):
         self.preexisting_device_names_found = set()
         self.preexisting_device_names_racked = set()
         self.preexisting_device_names_conflicted = set()
+        self.preexisting_device_names_seen = set()
         self.rack_conflict_rows = []
         self.unmatched_parent_rows = []
 
@@ -656,7 +657,7 @@ class PatchManagerImport(Job):
                 position = None
                 face = ""
 
-            existing_device = Device.objects.filter(name=name, location=location).first()
+            existing_device = Device.objects.filter(name=name).first()
 
             if existing_device:
                 is_preexisting = existing_device.pk in self.preexisting_device_ids
@@ -664,6 +665,12 @@ class PatchManagerImport(Job):
                 if is_preexisting:
                     self.preexisting_devices_found += 1
                     self.preexisting_device_names_found.add(existing_device.name)
+                    self.preexisting_device_names_seen.add(existing_device.name)
+
+                    self.logger.info(
+                        "PREEXISTING DEVICE FOUND: %s",
+                        existing_device.name,
+                    )
 
                 if rack and position is not None:
                     conflict_qs = Device.objects.filter(
@@ -676,6 +683,14 @@ class PatchManagerImport(Job):
                         if is_preexisting:
                             self.preexisting_devices_conflicted += 1
                             self.preexisting_device_names_conflicted.add(existing_device.name)
+
+                            self.logger.warning(
+                                "PREEXISTING DEVICE POSITION CONFLICT: device=%s rack=%s position=%s face=%s",
+                                existing_device.name,
+                                rack.name,
+                                position,
+                                face,
+                            )
 
                         self.logger.warning(
                             "Device existed previously: %s. Desired rack position is occupied. No rack changes made.",
@@ -693,6 +708,14 @@ class PatchManagerImport(Job):
                     if is_preexisting:
                         self.preexisting_devices_racked += 1
                         self.preexisting_device_names_racked.add(existing_device.name)
+
+                        self.logger.info(
+                            "PREEXISTING DEVICE RACKED: device=%s rack=%s position=%s face=%s",
+                            existing_device.name,
+                            rack.name,
+                            position,
+                            face,
+                        )
 
                 existing_device.validated_save()
 
@@ -829,7 +852,7 @@ class PatchManagerImport(Job):
                 template,
             )
 
-def log_preexisting_device_summary(self) -> None:
+    def log_preexisting_device_summary(self) -> None:
         self.logger.warning(
             "Pre-existing device summary: lines_found=%s unique_found=%s "
             "lines_racked=%s unique_racked=%s "
