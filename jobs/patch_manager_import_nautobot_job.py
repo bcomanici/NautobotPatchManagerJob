@@ -54,7 +54,8 @@ DEFAULT_MANUFACTURER_NAME = "Patch Manager"
 DEFAULT_LOCATION_TYPE_NAME = "Site"
 DEFAULT_STATUS_NAME = "Active"
 DEFAULT_DEVICE_ROLE_NAME = "Patch Manager Imported"
-DEFAULT_PASSIVE_ROLE_NAME = "Patch Manager Passive Infrastructure"
+DEFAULT_PASSIVE_ROLE_NAME = "Passive Infrastructure"
+DEFAULT_NEW_DEVICE_ROLE_NAME = "To Be Worked"
 DEFAULT_PASSIVE_MANUFACTURER_NAME = "Generic"
 DEFAULT_PASSIVE_PATCH_PANEL_ROLE_NAME = "Patch Manager Passive Patch Panel"
 PASSIVE_PATCH_PANEL_TEMPLATES = {
@@ -218,6 +219,8 @@ class PatchManagerImport(Job):
         self.no_valid_u_outcomes: Dict[int, Dict[str, str]] = {}
         self.rack_lookup_cache: Dict[str, List[Rack]] = {}
         self.rack_lookup_cache_loaded = False
+
+        self.preexisting_device_ids = set(Device.objects.values_list("id", flat=True))
 
         with transaction.atomic():
             if kwargs["import_mode"] in ("all", "inventory", "racks"):
@@ -643,6 +646,23 @@ class PatchManagerImport(Job):
 
             existing_device = Device.objects.filter(name=name).first()
 
+            if existing_device:
+                self.logger.warning(
+                    "Device existed previously: %s. Updating rack placement only.",
+                    existing_device.name,
+                )
+
+                existing_device.location = location
+                existing_device.rack = rack
+                existing_device.position = position
+                existing_device.face = face
+                existing_device.validated_save()
+
+                self.logger.info("Updated existing device %s", existing_device.name)
+                continue
+
+            role = self.get_or_create_device_role(DEFAULT_NEW_DEVICE_ROLE_NAME)
+
             self.handle_front_rear_shared_position(rack, position, face, device_type)
 
             if rack:
@@ -856,6 +876,13 @@ class PatchManagerImport(Job):
             )
 
         if not parent_device:
+            return None
+
+        if getattr(self, "preexisting_device_ids", None) and parent_device.id in self.preexisting_device_ids:
+            self.logger.warning(
+                "Device existed previously: %s. Skipping interface creation.",
+                parent_device.name,
+            )
             return None
 
         interface_name = self.safe_interface_name(parsed["interface_name"])
@@ -1287,7 +1314,7 @@ class PatchManagerImport(Job):
             re.sub(r"\s+", " ", f"{customer} {loop_name} Virtual Rack").strip()
         )
 
-        rack_location = location or self.get_or_create_location(customer)
+        rack_location = self.get_or_create_passive_location(location.name if location else customer)
         status = self.get_status()
 
         rack, created = Rack.objects.update_or_create(
@@ -1379,7 +1406,7 @@ class PatchManagerImport(Job):
             re.sub(r"\s+", " ", f"{pop_name} {context_name} Panel Virtual Rack").strip()
         )
 
-        rack_location = location or self.get_or_create_location(pop_name)
+        rack_location = self.get_or_create_passive_location(location.name if location else pop_name)
         status = self.get_status()
 
         rack, created = Rack.objects.update_or_create(
@@ -1513,7 +1540,7 @@ class PatchManagerImport(Job):
         rack_name = self.safe_nautobot_name(" ".join(part for part in context_parts if part).replace(" - ", " - "))
         rack_name = re.sub(r"\s+", " ", rack_name).strip()
 
-        rack_location = location or self.get_or_create_location(site_name)
+        rack_location = self.get_or_create_passive_location(location.name if location else site_name)
         status = self.get_status()
 
         rack, created = Rack.objects.update_or_create(
@@ -2861,6 +2888,13 @@ class PatchManagerImport(Job):
         if not device:
             return None
 
+        if getattr(self, "preexisting_device_ids", None) and device.id in self.preexisting_device_ids:
+            self.logger.warning(
+                "Device existed previously: %s. Skipping interface creation.",
+                device.name,
+            )
+            return None
+
         status = self.get_status()
 
         interface, _ = Interface.objects.get_or_create(
@@ -3537,7 +3571,7 @@ class PatchManagerImport(Job):
         if not virtual_rack_name:
             return None
 
-        rack_location = location or self.get_or_create_location(site_name)
+        rack_location = self.get_or_create_passive_location(location.name if location else site_name)
         status = self.get_status()
 
         comments = self.build_virtual_rack_comments(
@@ -3739,6 +3773,25 @@ class PatchManagerImport(Job):
                 return part.strip()
 
         return ""
+
+
+    def get_or_create_passive_location(self, name: str) -> Location:
+        passive_name = f"PASSIVE - {name}"
+
+        location_type, _ = LocationType.objects.get_or_create(
+            name=DEFAULT_LOCATION_TYPE_NAME,
+            defaults={"nestable": True},
+        )
+        self.ensure_location_type_content_types(location_type)
+
+        location, _ = Location.objects.get_or_create(
+            name=passive_name,
+            defaults={
+                "location_type": location_type,
+                "status": self.get_status(),
+            },
+        )
+        return location
 
     def get_or_create_location(self, qname: str, physical_address: str = "") -> Location:
         parts = [p.strip() for p in qname.split(",") if p.strip()]
