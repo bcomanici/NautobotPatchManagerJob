@@ -221,6 +221,7 @@ class PatchManagerImport(Job):
         self.rack_lookup_cache_loaded = False
 
         self.preexisting_device_ids = set(Device.objects.values_list("id", flat=True))
+        self.rack_conflict_rows = []
 
         with transaction.atomic():
             if kwargs["import_mode"] in ("all", "inventory", "racks"):
@@ -235,6 +236,7 @@ class PatchManagerImport(Job):
                 self.import_cables(client.get_collection("cables", kwargs["cable_format"], self.page_size))
 
             self.log_no_valid_u_summary()
+            self.log_rack_conflict_summary()
 
             if self.dryrun:
                 self.logger.warning("Dry run enabled; rolling back all database changes.")
@@ -644,7 +646,7 @@ class PatchManagerImport(Job):
                 position = None
                 face = ""
 
-            existing_device = Device.objects.filter(name=name).first()
+            existing_device = Device.objects.filter(name=name, location=location).first()
 
             if existing_device:
                 self.logger.warning(
@@ -652,10 +654,27 @@ class PatchManagerImport(Job):
                     existing_device.name,
                 )
 
+                if rack and position is not None:
+                    conflict_qs = Device.objects.filter(
+                        rack=rack,
+                        position=position,
+                        face=face,
+                    ).exclude(pk=existing_device.pk)
+
+                    if conflict_qs.exists():
+                        self.logger.warning(
+                            "Device existed previously: %s. Desired rack position is occupied. No rack changes made.",
+                            existing_device.name,
+                        )
+                        continue
+
                 existing_device.location = location
-                existing_device.rack = rack
-                existing_device.position = position
-                existing_device.face = face
+
+                if position is not None:
+                    existing_device.rack = rack
+                    existing_device.position = position
+                    existing_device.face = face
+
                 existing_device.validated_save()
 
                 self.logger.info("Updated existing device %s", existing_device.name)
@@ -674,6 +693,17 @@ class PatchManagerImport(Job):
                 conflicting_device = conflict_qs.first()
 
                 if conflicting_device:
+                    self.rack_conflict_rows.append(
+                        {
+                            "device": name,
+                            "rack": rack.name,
+                            "position": str(position),
+                            "face": face,
+                            "occupied_by": conflicting_device.name,
+                            "equipment_identifier": self.clean(row.get(self.fields["device_identifier"])),
+                            "equipment_template": self.clean(row.get(self.fields["device_type"])),
+                        }
+                    )
                     self.logger.warning(
                         "Rack position conflict for %s: rack=%s position=%s face=%s already occupied by %s. "
                         "Importing device without rack position.",
@@ -749,6 +779,29 @@ class PatchManagerImport(Job):
             self.logger.info("%s device %s", "Created" if created else "Updated", device.name)
 
         return skipped_port_detail_rows
+
+
+    def log_rack_conflict_summary(self) -> None:
+        if not getattr(self, "rack_conflict_rows", None):
+            self.logger.info("No rack-position conflicts were detected.")
+            return
+
+        self.logger.warning(
+            "Rack position conflict summary: %s device(s) could not be placed.",
+            len(self.rack_conflict_rows),
+        )
+
+        for item in self.rack_conflict_rows:
+            self.logger.warning(
+                "CONFLICT: device=%s rack=%s position=%s face=%s occupied_by=%s template=%r identifier=%r",
+                item["device"],
+                item["rack"],
+                item["position"],
+                item["face"],
+                item["occupied_by"],
+                item["equipment_template"],
+                item["equipment_identifier"],
+            )
 
     def log_device_import_validation_issue(
         self,
