@@ -851,6 +851,30 @@ class PatchManagerImport(Job):
                 device,
                 template,
             )
+            
+        counter = Counter()
+        sample_identifiers = {}
+
+        for item in self.unmatched_parent_rows:
+            key = (
+                item["device"],
+                item["template"],
+            )
+            counter[key] += 1
+
+            sample_identifiers.setdefault(
+                key,
+                item.get("identifier", ""),
+            )
+
+        for (device, template), count in counter.most_common():
+            self.logger.warning(
+                "UNMATCHED x%s: device=%s template=%r sample_identifier=%r",
+                count,
+                device,
+                template,
+                sample_identifiers.get((device, template), ""),
+            )
 
     def log_preexisting_device_summary(self) -> None:
         self.logger.warning(
