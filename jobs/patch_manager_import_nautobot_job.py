@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -227,8 +228,8 @@ class PatchManagerImport(Job):
         self.preexisting_device_names_found = set()
         self.preexisting_device_names_racked = set()
         self.preexisting_device_names_conflicted = set()
-        self.preexisting_device_names_seen = set()
         self.rack_conflict_rows = []
+        self.unmatched_parent_rows = []
 
         with transaction.atomic():
             if kwargs["import_mode"] in ("all", "inventory", "racks"):
@@ -245,6 +246,7 @@ class PatchManagerImport(Job):
             self.log_no_valid_u_summary()
             self.log_rack_conflict_summary()
             self.log_preexisting_device_summary()
+            self.log_unmatched_parent_summary()
 
             if self.dryrun:
                 self.logger.warning("Dry run enabled; rolling back all database changes.")
@@ -654,7 +656,7 @@ class PatchManagerImport(Job):
                 position = None
                 face = ""
 
-            existing_device = Device.objects.filter(name=name).first()
+            existing_device = Device.objects.filter(name=name, location=location).first()
 
             if existing_device:
                 is_preexisting = existing_device.pk in self.preexisting_device_ids
@@ -662,12 +664,6 @@ class PatchManagerImport(Job):
                 if is_preexisting:
                     self.preexisting_devices_found += 1
                     self.preexisting_device_names_found.add(existing_device.name)
-                    self.preexisting_device_names_seen.add(existing_device.name)
-
-                    self.logger.info(
-                        "PREEXISTING DEVICE FOUND: %s",
-                        existing_device.name,
-                    )
 
                 if rack and position is not None:
                     conflict_qs = Device.objects.filter(
@@ -680,14 +676,6 @@ class PatchManagerImport(Job):
                         if is_preexisting:
                             self.preexisting_devices_conflicted += 1
                             self.preexisting_device_names_conflicted.add(existing_device.name)
-
-                            self.logger.warning(
-                                "PREEXISTING DEVICE POSITION CONFLICT: device=%s rack=%s position=%s face=%s",
-                                existing_device.name,
-                                rack.name,
-                                position,
-                                face,
-                            )
 
                         self.logger.warning(
                             "Device existed previously: %s. Desired rack position is occupied. No rack changes made.",
@@ -705,14 +693,6 @@ class PatchManagerImport(Job):
                     if is_preexisting:
                         self.preexisting_devices_racked += 1
                         self.preexisting_device_names_racked.add(existing_device.name)
-
-                        self.logger.info(
-                            "PREEXISTING DEVICE RACKED: device=%s rack=%s position=%s face=%s",
-                            existing_device.name,
-                            rack.name,
-                            position,
-                            face,
-                        )
 
                 existing_device.validated_save()
 
@@ -821,7 +801,35 @@ class PatchManagerImport(Job):
 
 
 
-    def log_preexisting_device_summary(self) -> None:
+    
+    def log_unmatched_parent_summary(self) -> None:
+        if not getattr(self, "unmatched_parent_rows", None):
+            self.logger.info("No unmatched parent-device rows detected.")
+            return
+
+        counter = Counter()
+
+        for item in self.unmatched_parent_rows:
+            key = (
+                item["device"],
+                item["template"],
+            )
+            counter[key] += 1
+
+        self.logger.warning(
+            "UNMATCHED PARENT SUMMARY: %s rows",
+            len(self.unmatched_parent_rows),
+        )
+
+        for (device, template), count in counter.most_common():
+            self.logger.warning(
+                "UNMATCHED x%s: device=%s template=%r",
+                count,
+                device,
+                template,
+            )
+
+def log_preexisting_device_summary(self) -> None:
         self.logger.warning(
             "Pre-existing device summary: lines_found=%s unique_found=%s "
             "lines_racked=%s unique_racked=%s "
@@ -905,6 +913,14 @@ class PatchManagerImport(Job):
                 target_device = self.get_or_create_passive_infrastructure_device_for_row(row)
 
             if not target_device:
+                self.unmatched_parent_rows.append(
+                    {
+                        "device": self.clean(row.get(self.fields["device_name"])),
+                        "template": self.clean(row.get(self.fields["device_type"])),
+                        "identifier": self.clean(row.get(self.fields["device_identifier"])),
+                        "position": self.clean(row.get(self.fields["device_position"])),
+                    }
+                )
                 self.mark_no_valid_u_outcome(row, "no_matching_parent")
                 continue
 
