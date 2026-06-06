@@ -695,6 +695,17 @@ class PatchManagerImport(Job):
                         )
                     continue
 
+                if existing_device.rack_id:
+                    self.logger.warning(
+                        "Device existed previously and is already racked; skipping placement update: "
+                        "device=%s current_rack=%s current_position=%s current_face=%s",
+                        existing_device.name,
+                        existing_device.rack.name if existing_device.rack else None,
+                        existing_device.position,
+                        existing_device.face,
+                    )
+                    continue
+
                 if rack and position is not None:
                     conflict_qs = Device.objects.filter(
                         rack=rack,
@@ -740,7 +751,68 @@ class PatchManagerImport(Job):
                             face,
                         )
 
-                existing_device.validated_save()
+                try:
+                    existing_device.validated_save()
+                except ValidationError as exc:
+                    self.log_device_import_validation_issue(
+                        name=name,
+                        row=row,
+                        rack=rack,
+                        position=position,
+                        face=face,
+                        device_type=device_type,
+                        exc=exc,
+                    )
+
+                    message_dict = getattr(exc, "message_dict", {}) or {}
+                    messages = " ".join(str(message) for message in getattr(exc, "messages", []))
+                    message_text = f"{message_dict} {messages} {exc}".lower()
+
+                    if not (
+                        "position" in message_dict
+                        or "face" in message_dict
+                        or "already occupied" in message_text
+                        or "sufficient space" in message_text
+                        or "accommodate this device type" in message_text
+                    ):
+                        raise
+
+                    if rack and position is not None:
+                        occupied_by = ""
+                        conflict_qs = Device.objects.filter(
+                            rack=rack,
+                            position=position,
+                            face=face,
+                        ).exclude(pk=existing_device.pk)
+                        conflicting_device = conflict_qs.first()
+                        if conflicting_device:
+                            occupied_by = conflicting_device.name
+
+                        self.rack_conflict_rows.append(
+                            {
+                                "device": existing_device.name,
+                                "rack": rack.name,
+                                "position": str(position),
+                                "face": face,
+                                "occupied_by": occupied_by or "validation_failed",
+                                "equipment_identifier": self.clean(row.get(self.fields["device_identifier"])),
+                                "equipment_template": self.clean(row.get(self.fields["device_type"])),
+                            }
+                        )
+
+                    if is_preexisting:
+                        self.preexisting_devices_conflicted += 1
+                        self.preexisting_device_names_conflicted.add(existing_device.name)
+
+                    self.logger.warning(
+                        "Existing device %s could not be placed at rack=%s position=%s face=%s due to validation. "
+                        "Leaving existing rack placement unchanged and continuing.",
+                        existing_device.name,
+                        rack.name if rack else None,
+                        position,
+                        face,
+                    )
+                    continue
 
                 self.logger.info("Updated existing device %s", existing_device.name)
                 continue
