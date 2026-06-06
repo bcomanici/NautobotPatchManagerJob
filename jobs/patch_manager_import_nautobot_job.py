@@ -58,7 +58,7 @@ DEFAULT_DEVICE_ROLE_NAME = "Patch Manager Imported"
 DEFAULT_PASSIVE_ROLE_NAME = "Passive Infrastructure"
 DEFAULT_NEW_DEVICE_ROLE_NAME = "To Be Worked"
 DEFAULT_PASSIVE_MANUFACTURER_NAME = "Generic"
-DEFAULT_PASSIVE_PATCH_PANEL_ROLE_NAME = "Patch Manager Passive Patch Panel"
+DEFAULT_PASSIVE_PATCH_PANEL_ROLE_NAME = DEFAULT_PASSIVE_ROLE_NAME
 PASSIVE_PATCH_PANEL_TEMPLATES = {
     "generic fiber panel 1u - 2 slot",
     "generic fiber 6 sc duplex sm",
@@ -1342,7 +1342,7 @@ class PatchManagerImport(Job):
             equipment_template=equipment_template,
         )
         device_type = self.get_or_create_passive_device_type(equipment_template)
-        role = self.get_or_create_device_role(DEFAULT_PASSIVE_PATCH_PANEL_ROLE_NAME)
+        role = self.get_or_create_device_role(DEFAULT_PASSIVE_ROLE_NAME)
         status = self.get_status()
 
         base_defaults = {
