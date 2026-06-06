@@ -1523,6 +1523,31 @@ class PatchManagerImport(Job):
             if self.is_general_passive_panel_context(clean_part):
                 return self.safe_nautobot_name(clean_part)
 
+        # If this is a passive child row such as "..., Parent Panel, 1, 1"
+        # and the parent token does not contain an obvious panel keyword, still
+        # use the nearest meaningful non-child token as the parent container.
+        # This catches PM objects like "Phelps FDP1 - FirstLight", "DRT Panel
+        # NJEdge", "NYSERNet - LAB", and similar passive handoff labels.
+        child_tail_seen = False
+        for part in reversed(parts):
+            clean_part = re.sub(r"\s+", " ", part).strip()
+            normalized = self.normalize_pm_match_text(clean_part)
+
+            if self.looks_like_passive_child_label(clean_part):
+                child_tail_seen = True
+                continue
+
+            if not child_tail_seen:
+                continue
+
+            if not normalized or normalized in IGNORED_RACK_LOOKUP_TOKENS:
+                continue
+
+            if re.search(r"\d+\s+[a-z]+\s+(street|st|avenue|ave|road|rd|court|ct|drive|dr|broad|main)\b", normalized):
+                continue
+
+            return self.safe_nautobot_name(clean_part)
+
         return ""
 
     @staticmethod
@@ -1551,16 +1576,27 @@ class PatchManagerImport(Job):
 
         patterns = (
             r"\brack\s+\d+\.\d+\s+panel\s+\d+\b",
+            r"\brack\s+\d{1,4}\.\d{2}\.\d{2}\b",
+            r"\brack\s+\d+\s+sh\s+\d+\b",
             r"\bws\s*-\s*\d+\s*pnl\d+\b",
             r"\bpnl\d+\b",
+            r"\bpanel\b",
             r"\bfpp[#\-/]?\d*\b",
             r"\bub\s*-?\s*fpp\b",
+            r"\bfdp\d*\b",
+            r"\bosp\s+fdp\b",
+            r"\bcrown\s+castle\s+(osp|fdp)\b",
+            r"\bfr[- ]?\d+\b",
+            r"\blgx\s*\d+\b",
+            r"\b[a-z0-9. -]*lgx[a-z0-9. -]*\b",
+            r"^odp[.\w-]+",
             r"^rr[\s.:]\s*[\w.:-]+",
             r"\brr\s+\d+\.\d+\b",
             r"\bcf\.?\d{2}\.\d{2}\.\d{2}\b",
             r"^\d{2,4}\.\d{2,4}\.\d{2,4}(?:\.\d{2,4})?(?:\s+\S.*)?$",
             r"\bunknown panel\b",
             r"\bnon nysernet panels?\b",
+            r"\b(optical equipment|router|switch|storage node)\b",
         )
 
         return any(re.search(pattern, normalized) for pattern in patterns)
@@ -2289,13 +2325,21 @@ class PatchManagerImport(Job):
         # Remaining no-valid-U rows are often passive panel children/modules
         # rather than standalone rackable devices. Treat these as passive-panel
         # rows so their details attach to a created/resolved parent panel.
-        if normalized.startswith("generic fiber "):
-            return True
+        passive_keywords = (
+            "generic fiber",
+            "fiber panel",
+            "fiber splitter",
+            "fiber 4 port mpo",
+            "keystone",
+            "rj45",
+            "bulkhead",
+            "patch panel",
+            "pp 24 port",
+            "lcd mm",
+            "modified for router config",
+        )
 
-        if normalized in {"rj45", "24 port keystone jack patch panel"}:
-            return True
-
-        return False
+        return any(keyword in normalized for keyword in passive_keywords)
 
     def build_passive_patch_panel_device_name(
         self,
