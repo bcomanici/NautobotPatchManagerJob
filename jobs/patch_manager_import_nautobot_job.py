@@ -1321,6 +1321,12 @@ class PatchManagerImport(Job):
             identifier_parts=identifier_parts,
             location=location,
         )
+        if not rack and self.is_rj45_bulkhead_template(equipment_template):
+            rack = self.get_or_create_rj45_bulkhead_virtual_rack(
+                identifier_parts=identifier_parts,
+                location=location,
+            )
+
         if not rack:
             self.logger.warning(
                 "Passive patch panel row could not resolve a real rack; leaving unmatched. "
@@ -1437,6 +1443,86 @@ class PatchManagerImport(Job):
             return rack
 
         return self.get_or_create_passive_panel_coordinate_rack(identifier_parts, location)
+
+
+    @staticmethod
+    def is_rj45_bulkhead_template(value: str) -> bool:
+        normalized = re.sub(r"\s+", " ", (value or "").strip().lower())
+        return "rj45" in normalized and "bulkhead" in normalized
+
+    def get_or_create_rj45_bulkhead_virtual_rack(
+        self,
+        identifier_parts: List[str],
+        location: Optional[Location],
+    ) -> Optional[Rack]:
+        """
+        Create a narrow logical rack for RJ45 bulkhead rows that live under a
+        cage/location hierarchy but do not resolve to a cabinet rack.
+
+        Example:
+            32 AoA Colo, 32 AoA, 24th Floor, NYSERNet Cage, Door Controller
+        becomes:
+            32 AoA Colo NYSERNet Cage RJ45 Bulkhead Passive Virtual Rack
+        """
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+        if not parts:
+            return None
+
+        normalized_parts = [self.normalize_pm_match_text(part) for part in parts]
+        if not any("cage" in part or "bulkhead" in part for part in normalized_parts):
+            return None
+
+        site_name = self.get_rack_name_prefix_from_identifier(parts)
+        if not site_name and location:
+            site_name = location.name
+        if not site_name:
+            site_name = "Patch Manager"
+
+        context = ""
+        for part in parts:
+            normalized = self.normalize_pm_match_text(part)
+            if "cage" in normalized or "bulkhead" in normalized:
+                context = self.clean(part).replace("<COMMA>", ",")
+                break
+
+        if not context:
+            context = "RJ45 Bulkhead"
+
+        rack_name = self.safe_nautobot_name(
+            re.sub(
+                r"\s+",
+                " ",
+                f"{site_name} {context} RJ45 Bulkhead Passive Virtual Rack",
+            ).strip()
+        )
+
+        rack_location = self.get_or_create_passive_location(location.name if location else site_name)
+        status = self.get_status()
+
+        rack, created = Rack.objects.update_or_create(
+            name=rack_name,
+            location=rack_location,
+            defaults={
+                "status": status,
+                "u_height": DEFAULT_RACK_HEIGHT,
+                "comments": (
+                    "Virtual rack created by Patch Manager import for RJ45 bulkhead "
+                    "passive infrastructure grouping. This is a logical container, "
+                    "not a physical cabinet from the Cabinet export."
+                ),
+            },
+        )
+
+        self.add_rack_to_lookup_cache(rack)
+
+        self.logger.info(
+            "%s RJ45 bulkhead virtual rack %s from identifier parts=%s",
+            "Created" if created else "Updated",
+            rack.name,
+            parts,
+        )
+
+        return rack
 
 
     def get_or_create_general_passive_panel_virtual_rack(
