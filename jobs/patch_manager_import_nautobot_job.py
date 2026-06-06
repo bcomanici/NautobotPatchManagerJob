@@ -2544,10 +2544,10 @@ class PatchManagerImport(Job):
         existing_device = Device.objects.filter(name=device_name).first()
         if existing_device:
             if existing_device.role_id != role.pk:
+                Device.objects.filter(pk=existing_device.pk).update(role=role)
                 existing_device.role = role
-                existing_device.validated_save()
                 self.logger.info(
-                    "Updated existing passive infrastructure device role only: %s -> %s",
+                    "Updated existing passive infrastructure device role only without placement validation: %s -> %s",
                     existing_device.name,
                     role.name,
                 )
@@ -2628,10 +2628,10 @@ class PatchManagerImport(Job):
         if existing_device:
             passive_role = base_defaults.get("role") or self.get_or_create_device_role(DEFAULT_PASSIVE_ROLE_NAME)
             if existing_device.role_id != passive_role.pk:
+                Device.objects.filter(pk=existing_device.pk).update(role=passive_role)
                 existing_device.role = passive_role
-                existing_device.validated_save()
                 self.logger.info(
-                    "Updated existing passive infrastructure device role only: %s -> %s",
+                    "Updated existing passive infrastructure device role only without placement validation: %s -> %s",
                     existing_device.name,
                     passive_role.name,
                 )
