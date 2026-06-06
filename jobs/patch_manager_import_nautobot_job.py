@@ -1432,7 +1432,138 @@ class PatchManagerImport(Job):
         if rack:
             return rack
 
+        rack = self.get_or_create_general_passive_panel_virtual_rack(identifier_parts, location)
+        if rack:
+            return rack
+
         return self.get_or_create_passive_panel_coordinate_rack(identifier_parts, location)
+
+
+    def get_or_create_general_passive_panel_virtual_rack(
+        self,
+        identifier_parts: List[str],
+        location: Optional[Location],
+    ) -> Optional[Rack]:
+        """
+        Create a controlled logical rack for passive panel objects that do not
+        resolve to a Cabinet export rack but clearly identify a passive panel or
+        rack-room coordinate in the PM hierarchy.
+
+        This catches the remaining classes such as:
+        - Rack 101.03 Panel 2
+        - WS - 207 pnl1 / pnl5
+        - UB-FPP / FPP#3/03
+        - RR 520.10 / RR.821.05.23 CC / RR: 01.02.01
+        - CF03.01.12 Stony Brook
+        - Numeric coordinate panels such as 024.07.04.37
+        """
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+        if not parts:
+            return None
+
+        panel_name = self.build_general_passive_panel_device_name_from_identifier(parts)
+        if not panel_name:
+            return None
+
+        site_name = self.get_rack_name_prefix_from_identifier(parts)
+        if not site_name and location:
+            site_name = location.name
+        if not site_name:
+            site_name = "Patch Manager"
+
+        rack_name = self.safe_nautobot_name(
+            re.sub(r"\s+", " ", f"{site_name} {panel_name} Passive Virtual Rack").strip()
+        )
+
+        rack_location = self.get_or_create_passive_location(location.name if location else site_name)
+        status = self.get_status()
+
+        rack, created = Rack.objects.update_or_create(
+            name=rack_name,
+            location=rack_location,
+            defaults={
+                "status": status,
+                "u_height": DEFAULT_RACK_HEIGHT,
+                "comments": (
+                    "Virtual rack created by Patch Manager import for unresolved "
+                    "passive panel / rack-room coordinate grouping. This is a "
+                    "logical container, not a physical cabinet from the Cabinet export."
+                ),
+            },
+        )
+
+        self.add_rack_to_lookup_cache(rack)
+
+        self.logger.info(
+            "%s general passive panel virtual rack %s from identifier parts=%s",
+            "Created" if created else "Updated",
+            rack.name,
+            parts,
+        )
+
+        return rack
+
+    def build_general_passive_panel_device_name_from_identifier(self, identifier_parts: List[str]) -> str:
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+        if not parts:
+            return ""
+
+        # Prefer the first meaningful token scanning right-to-left, ignoring
+        # trailing passive port labels such as "1", "2", or "1,20".
+        for part in reversed(parts):
+            clean_part = re.sub(r"\s+", " ", part).strip()
+            normalized = self.normalize_pm_match_text(clean_part)
+
+            if not normalized or normalized in IGNORED_RACK_LOOKUP_TOKENS:
+                continue
+
+            if self.looks_like_passive_child_label(clean_part):
+                continue
+
+            if self.is_general_passive_panel_context(clean_part):
+                return self.safe_nautobot_name(clean_part)
+
+        return ""
+
+    @staticmethod
+    def looks_like_passive_child_label(value: str) -> bool:
+        token = re.sub(r"\s+", " ", (value or "").replace("<COMMA>", ",").strip().lower())
+        if not token:
+            return True
+
+        if re.match(r"^\d+$", token):
+            return True
+
+        if re.match(r"^\d+\s*,\s*\d+$", token):
+            return True
+
+        if re.match(r"^(lc|mic|mpa|pic|slot|module)\s*-?\s*\d+$", token):
+            return True
+
+        return False
+
+    def is_general_passive_panel_context(self, value: str) -> bool:
+        text = re.sub(r"\s+", " ", (value or "").replace("<COMMA>", ",").strip())
+        normalized = self.normalize_pm_match_text(text)
+
+        if not normalized:
+            return False
+
+        patterns = (
+            r"\brack\s+\d+\.\d+\s+panel\s+\d+\b",
+            r"\bws\s*-\s*\d+\s*pnl\d+\b",
+            r"\bpnl\d+\b",
+            r"\bfpp[#\-/]?\d*\b",
+            r"\bub\s*-?\s*fpp\b",
+            r"^rr[\s.:]\s*[\w.:-]+",
+            r"\brr\s+\d+\.\d+\b",
+            r"\bcf\.?\d{2}\.\d{2}\.\d{2}\b",
+            r"^\d{2,4}\.\d{2,4}\.\d{2,4}(?:\.\d{2,4})?(?:\s+\S.*)?$",
+            r"\bunknown panel\b",
+            r"\bnon nysernet panels?\b",
+        )
+
+        return any(re.search(pattern, normalized) for pattern in patterns)
 
     def get_or_create_loop_cage_panel_virtual_rack(
         self,
@@ -1603,8 +1734,8 @@ class PatchManagerImport(Job):
 
         return any(
             re.search(r"\b(pnl|panel)\s*#?\d*\b", part)
-            or re.search(r"\bfpp[#\-]?\d", part)
-            or re.search(r"\bub\s*-\s*fpp#", part)
+            or re.search(r"\bfpp[#\-/]?\d*\b", part)
+            or re.search(r"\bub\s*-?\s*fpp\b", part)
             or "unknown panel" in part
             for part in normalized_parts
         )
@@ -1642,7 +1773,7 @@ class PatchManagerImport(Job):
             if re.search(r"\brr\s*\d+\.\d+\b", normalized):
                 return self.safe_nautobot_name(clean_part)
 
-            if re.search(r"\bfpp[#\-]?\d", normalized):
+            if re.search(r"\bfpp[#\-/]?\d*\b", normalized):
                 return self.safe_nautobot_name(clean_part)
 
             if "unknown panel" in normalized:
@@ -2152,7 +2283,19 @@ class PatchManagerImport(Job):
     @staticmethod
     def is_passive_patch_panel_template(value: str) -> bool:
         normalized = re.sub(r"\s+", " ", (value or "").strip().lower())
-        return normalized in PASSIVE_PATCH_PANEL_TEMPLATES
+        if normalized in PASSIVE_PATCH_PANEL_TEMPLATES:
+            return True
+
+        # Remaining no-valid-U rows are often passive panel children/modules
+        # rather than standalone rackable devices. Treat these as passive-panel
+        # rows so their details attach to a created/resolved parent panel.
+        if normalized.startswith("generic fiber "):
+            return True
+
+        if normalized in {"rj45", "24 port keystone jack patch panel"}:
+            return True
+
+        return False
 
     def build_passive_patch_panel_device_name(
         self,
@@ -2172,9 +2315,17 @@ class PatchManagerImport(Job):
         if buffalo_panel_name and self.is_imported_virtual_rack(rack):
             return buffalo_panel_name
 
+        general_panel_name = self.build_general_passive_panel_device_name_from_identifier(identifier_parts)
+        if general_panel_name and self.is_imported_virtual_rack(rack):
+            return general_panel_name
+
         name_parts = [rack.name, equipment_template]
 
-        if label and self.normalize_pm_match_text(label) != self.normalize_pm_match_text(equipment_template):
+        if (
+            label
+            and self.normalize_pm_match_text(label) != self.normalize_pm_match_text(equipment_template)
+            and not self.looks_like_passive_child_label(label)
+        ):
             name_parts.append(label)
         else:
             meaningful_tail = self.find_passive_patch_panel_identifier_tail(identifier_parts, equipment_template)
@@ -2198,6 +2349,9 @@ class PatchManagerImport(Job):
                 continue
 
             if normalized_part == normalized_template:
+                continue
+
+            if self.looks_like_passive_child_label(clean_part):
                 continue
 
             if normalized_part in IGNORED_RACK_LOOKUP_TOKENS:
