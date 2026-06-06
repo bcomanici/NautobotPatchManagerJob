@@ -2542,35 +2542,22 @@ class PatchManagerImport(Job):
         }
 
         existing_device = Device.objects.filter(name=device_name).first()
-        if existing_device and existing_device.rack_id:
-            defaults = dict(base_defaults)
-            defaults["position"] = existing_device.position
-            defaults["face"] = existing_device.face or "front"
-
-            try:
-                with transaction.atomic():
-                    device, created = Device.objects.update_or_create(
-                        name=device_name,
-                        defaults=defaults,
-                    )
-
+        if existing_device:
+            if existing_device.role_id != role.pk:
+                existing_device.role = role
+                existing_device.validated_save()
                 self.logger.info(
-                    "%s passive infrastructure device %s in rack %s",
-                    "Created" if created else "Updated",
-                    device.name,
-                    rack.name,
+                    "Updated existing passive infrastructure device role only: %s -> %s",
+                    existing_device.name,
+                    role.name,
                 )
-                return device
-            except (ValidationError, IntegrityError, DataError) as exc:
-                self.logger.warning(
-                    "Existing passive infrastructure placement is invalid for %s in rack=%s "
-                    "position=%s face=%s: %s. Searching for a new valid U.",
-                    device_name,
-                    rack.name,
-                    existing_device.position,
-                    existing_device.face,
-                    exc,
+            else:
+                self.logger.info(
+                    "Existing passive infrastructure device already has role %s; leaving rack placement unchanged: %s",
+                    role.name,
+                    existing_device.name,
                 )
+            return existing_device
 
         return self.create_or_update_passive_device_in_first_valid_u(
             device_name=device_name,
@@ -2638,6 +2625,24 @@ class PatchManagerImport(Job):
         failed_positions: List[str] = []
         existing_device = Device.objects.filter(name=device_name).first()
 
+        if existing_device:
+            passive_role = base_defaults.get("role") or self.get_or_create_device_role(DEFAULT_PASSIVE_ROLE_NAME)
+            if existing_device.role_id != passive_role.pk:
+                existing_device.role = passive_role
+                existing_device.validated_save()
+                self.logger.info(
+                    "Updated existing passive infrastructure device role only: %s -> %s",
+                    existing_device.name,
+                    passive_role.name,
+                )
+            else:
+                self.logger.info(
+                    "Existing passive infrastructure device already has role %s; leaving rack placement unchanged: %s",
+                    passive_role.name,
+                    existing_device.name,
+                )
+            return existing_device
+
         for position in range(rack.u_height, 0, -1):
             for face in ("front", "rear"):
                 defaults = dict(base_defaults)
@@ -2675,9 +2680,30 @@ class PatchManagerImport(Job):
                     return device
 
                 except ValidationError as exc:
-                    message_dict = getattr(exc, "message_dict", {})
-                    if "position" in message_dict or "face" in message_dict:
+                    # Nautobot may report rack occupancy/space errors either as
+                    # message_dict["position"] or as plain messages. Treat any
+                    # rack-placement validation as a failed candidate U/face and
+                    # keep searching instead of aborting the whole job.
+                    message_dict = getattr(exc, "message_dict", {}) or {}
+                    messages = " ".join(str(message) for message in getattr(exc, "messages", []))
+                    message_text = f"{message_dict} {messages} {exc}".lower()
+
+                    if (
+                        "position" in message_dict
+                        or "face" in message_dict
+                        or "already occupied" in message_text
+                        or "sufficient space" in message_text
+                        or "accommodate this device type" in message_text
+                    ):
                         failed_positions.append(f"{position}/{face}:validation")
+                        self.logger.warning(
+                            "Passive infrastructure candidate placement failed for %s at rack=%s U%s face=%s: %s. Trying next position.",
+                            device_name,
+                            rack.name,
+                            position,
+                            face,
+                            exc,
+                        )
                         continue
 
                     self.logger.warning(
