@@ -831,6 +831,8 @@ class PatchManagerImport(Job):
             return
 
         counter = Counter()
+        sample_identifiers: Dict[Tuple[str, str], str] = {}
+        sample_positions: Dict[Tuple[str, str], str] = {}
 
         for item in self.unmatched_parent_rows:
             key = (
@@ -838,6 +840,8 @@ class PatchManagerImport(Job):
                 item["template"],
             )
             counter[key] += 1
+            sample_identifiers.setdefault(key, item.get("identifier", ""))
+            sample_positions.setdefault(key, item.get("position", ""))
 
         self.logger.warning(
             "UNMATCHED PARENT SUMMARY: %s rows",
@@ -845,35 +849,14 @@ class PatchManagerImport(Job):
         )
 
         for (device, template), count in counter.most_common():
+            key = (device, template)
             self.logger.warning(
-                "UNMATCHED x%s: device=%s template=%r",
+                "UNMATCHED x%s: device=%s template=%r position=%r sample_identifier=%r",
                 count,
                 device,
                 template,
-            )
-            
-        counter = Counter()
-        sample_identifiers = {}
-
-        for item in self.unmatched_parent_rows:
-            key = (
-                item["device"],
-                item["template"],
-            )
-            counter[key] += 1
-
-            sample_identifiers.setdefault(
-                key,
-                item.get("identifier", ""),
-            )
-
-        for (device, template), count in counter.most_common():
-            self.logger.warning(
-                "UNMATCHED x%s: device=%s template=%r sample_identifier=%r",
-                count,
-                device,
-                template,
-                sample_identifiers.get((device, template), ""),
+                sample_positions.get(key, ""),
+                sample_identifiers.get(key, ""),
             )
 
     def log_preexisting_device_summary(self) -> None:
@@ -1613,10 +1596,18 @@ class PatchManagerImport(Job):
         if "buffalo - pop" not in joined:
             return False
 
-        if not any("meet me room" in part or "windstream pop" in part for part in normalized_parts):
-            return False
+        # Buffalo passive panels may appear under several PoP subcontexts:
+        # Windstream, Meet-Me Room, UB/CRTC, or directly as FPP/pnl panel labels.
+        if any("meet me room" in part or "windstream pop" in part for part in normalized_parts):
+            return bool(self.build_buffalo_pop_panel_device_name_from_identifier(parts))
 
-        return bool(self.build_buffalo_pop_panel_device_name_from_identifier(parts))
+        return any(
+            re.search(r"\b(pnl|panel)\s*#?\d*\b", part)
+            or re.search(r"\bfpp[#\-]?\d", part)
+            or re.search(r"\bub\s*-\s*fpp#", part)
+            or "unknown panel" in part
+            for part in normalized_parts
+        )
 
     @staticmethod
     def get_buffalo_pop_name(parts: List[str]) -> str:
@@ -1634,6 +1625,8 @@ class PatchManagerImport(Job):
             normalized = self.normalize_pm_match_text(clean_part)
             if "meet me room" in normalized or "windstream pop" in normalized:
                 return clean_part
+            if "crtc" in normalized or "875 ellicott" in normalized:
+                return clean_part
         return "Buffalo Passive Panels"
 
     def build_buffalo_pop_panel_device_name_from_identifier(self, identifier_parts: List[str]) -> str:
@@ -1650,6 +1643,9 @@ class PatchManagerImport(Job):
                 return self.safe_nautobot_name(clean_part)
 
             if re.search(r"\bfpp[#\-]?\d", normalized):
+                return self.safe_nautobot_name(clean_part)
+
+            if "unknown panel" in normalized:
                 return self.safe_nautobot_name(clean_part)
 
         return ""
@@ -2239,6 +2235,12 @@ class PatchManagerImport(Job):
 
         rack = self.find_rack_from_names(identifier_parts, location)
         if not rack:
+            rack = self.get_or_create_customer_location_passive_virtual_rack(
+                identifier_parts=identifier_parts,
+                location=location,
+            )
+
+        if not rack:
             return None
 
         device_name = self.safe_nautobot_name(f"{rack.name} {bucket_type}")
@@ -2291,6 +2293,53 @@ class PatchManagerImport(Job):
             rack=rack,
             base_defaults=base_defaults,
         )
+
+    def get_or_create_customer_location_passive_virtual_rack(
+        self,
+        identifier_parts: List[str],
+        location: Optional[Location],
+    ) -> Optional[Rack]:
+        """
+        Create a controlled PASSIVE virtual rack for Customer Locations rows that
+        identify a customer-side passive container, router handoff, OSP FDP, or
+        Crown Castle FDP but do not include a physical rack token.
+        """
+        parts = [self.clean(part).replace("<COMMA>", ",") for part in identifier_parts if self.clean(part)]
+        if len(parts) < 2:
+            return None
+
+        if self.normalize_pm_match_text(parts[0]) != "customer locations":
+            return None
+
+        customer_name = parts[1]
+        rack_name = self.safe_nautobot_name(f"{customer_name} Passive Infrastructure Virtual Rack")
+        rack_location = self.get_or_create_passive_location(location.name if location else customer_name)
+        status = self.get_status()
+
+        rack, created = Rack.objects.update_or_create(
+            name=rack_name,
+            location=rack_location,
+            defaults={
+                "status": status,
+                "u_height": DEFAULT_RACK_HEIGHT,
+                "comments": (
+                    "Virtual rack created by Patch Manager import for Customer Locations "
+                    "passive/customer-edge infrastructure grouping. This is a logical "
+                    "container, not a physical cabinet from the Cabinet export."
+                ),
+            },
+        )
+
+        self.add_rack_to_lookup_cache(rack)
+
+        self.logger.info(
+            "%s customer-location passive virtual rack %s from identifier parts=%s",
+            "Created" if created else "Updated",
+            rack.name,
+            parts,
+        )
+
+        return rack
 
     def create_or_update_passive_device_in_first_valid_u(
         self,
@@ -2412,11 +2461,26 @@ class PatchManagerImport(Job):
         if not normalized:
             return ""
 
-        if "crown castle fdp" in normalized:
+        if "crown castle" in normalized and "fdp" in normalized:
             return "Crown Castle FDP"
+
+        if "osp" in normalized and "fdp" in normalized:
+            return text
 
         if "fdp" in normalized:
             return text
+
+        if re.search(r"\bfpp[#\-]?\d", normalized):
+            return "Fiber Patch Panel"
+
+        if re.search(r"\bpnl\s*#?\d+\b", normalized) or re.search(r"\bpanel\s*#?\d+\b", normalized):
+            return "Passive Panel"
+
+        if "unknown panel" in normalized:
+            return "Passive Panel"
+
+        if normalized.endswith(" router") or " router" in normalized:
+            return "Customer Router"
 
         if "non nysernet panel" in normalized:
             return "Non NYSERNet Panels"
