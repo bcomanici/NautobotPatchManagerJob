@@ -624,8 +624,13 @@ class PatchManagerImport(Job):
                 continue
 
             identifier_data = self.parse_equipment_identifier(self.clean(row.get(self.fields["device_identifier"])))
+            equipment_template = self.clean(row.get(self.fields["device_type"]))
+            row_is_passive_infrastructure = (
+                self.is_passive_patch_panel_template(equipment_template)
+                or bool(self.detect_passive_infrastructure_bucket(identifier_data["identifier_parts"]))
+            )
 
-            device_type = self.get_or_create_device_type(self.clean(row.get(self.fields["device_type"])))
+            device_type = self.get_or_create_device_type(equipment_template)
             role = self.get_or_create_device_role(identifier_data["role"])
             location = self.get_or_create_location(
                 identifier_data["location"] or "Patch Manager",
@@ -671,6 +676,24 @@ class PatchManagerImport(Job):
                         "PREEXISTING DEVICE FOUND: %s",
                         existing_device.name,
                     )
+
+                if row_is_passive_infrastructure:
+                    passive_role = self.get_or_create_device_role(DEFAULT_PASSIVE_ROLE_NAME)
+                    if existing_device.role_id != passive_role.pk:
+                        Device.objects.filter(pk=existing_device.pk).update(role=passive_role)
+                        existing_device.role = passive_role
+                        self.logger.info(
+                            "Updated existing passive device role only without placement validation: %s -> %s",
+                            existing_device.name,
+                            passive_role.name,
+                        )
+                    else:
+                        self.logger.info(
+                            "Existing passive device already has role %s; leaving rack placement unchanged: %s",
+                            passive_role.name,
+                            existing_device.name,
+                        )
+                    continue
 
                 if rack and position is not None:
                     conflict_qs = Device.objects.filter(
@@ -722,7 +745,10 @@ class PatchManagerImport(Job):
                 self.logger.info("Updated existing device %s", existing_device.name)
                 continue
 
-            role = self.get_or_create_device_role(DEFAULT_NEW_DEVICE_ROLE_NAME)
+            if row_is_passive_infrastructure:
+                role = self.get_or_create_device_role(DEFAULT_PASSIVE_ROLE_NAME)
+            else:
+                role = self.get_or_create_device_role(DEFAULT_NEW_DEVICE_ROLE_NAME)
 
             self.handle_front_rear_shared_position(rack, position, face, device_type)
 
@@ -784,7 +810,17 @@ class PatchManagerImport(Job):
                     exc=exc,
                 )
 
-                if "position" not in getattr(exc, "message_dict", {}):
+                message_dict = getattr(exc, "message_dict", {}) or {}
+                messages = " ".join(str(message) for message in getattr(exc, "messages", []))
+                message_text = f"{message_dict} {messages} {exc}".lower()
+
+                if not (
+                    "position" in message_dict
+                    or "face" in message_dict
+                    or "already occupied" in message_text
+                    or "sufficient space" in message_text
+                    or "accommodate this device type" in message_text
+                ):
                     raise
 
                 self.logger.warning(
@@ -1341,8 +1377,26 @@ class PatchManagerImport(Job):
             rack=rack,
             equipment_template=equipment_template,
         )
-        device_type = self.get_or_create_passive_device_type(equipment_template)
         role = self.get_or_create_device_role(DEFAULT_PASSIVE_ROLE_NAME)
+        existing_device = Device.objects.filter(name=device_name).first()
+        if existing_device:
+            if existing_device.role_id != role.pk:
+                Device.objects.filter(pk=existing_device.pk).update(role=role)
+                existing_device.role = role
+                self.logger.info(
+                    "Updated existing passive patch panel role only without placement validation: %s -> %s",
+                    existing_device.name,
+                    role.name,
+                )
+            else:
+                self.logger.info(
+                    "Existing passive patch panel already has role %s; leaving rack placement unchanged: %s",
+                    role.name,
+                    existing_device.name,
+                )
+            return existing_device
+
+        device_type = self.get_or_create_passive_device_type(equipment_template)
         status = self.get_status()
 
         base_defaults = {
